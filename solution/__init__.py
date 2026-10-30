@@ -31,7 +31,7 @@ from .mlp import patch_qwen2_mlp_fp16
 
 USE_ADDNORM = True        # K3
 USE_UNPAD = True          # U
-USE_MLP_RECOMPUTE = False  # S4: about -1.7 GiB peak for about +95-145 ms per step
+USE_MLP_RECOMPUTE = True   # S4
 USE_HEAD_CE = True        # K2
 
 
