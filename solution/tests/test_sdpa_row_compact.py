@@ -98,6 +98,8 @@ def call(qkv, mask, dout, *, causal, rows, idx=None, bthd=True, hook=None, scope
     for t in qkv:
         t.grad = None
     q, k, v = (as_bhtd(t, bthd) for t in qkv)
+    # Leaf layout and bthd must agree, else q / k arrive as [B, T, H, D] (heads = T).
+    assert q.shape[1] == HEADS and k.shape[1] == KV_HEADS and v.shape[1] == KV_HEADS, q.shape
     seq = q.shape[2]
     kwargs = dict(dropout=0.0, scaling=SCALE, sliding_window=None)
     kwargs.update(kw)
@@ -188,8 +190,12 @@ def test_real_rows_match_full_saves(patched, seq, causal, bthd):
     qkv = leaves(seq, seed=seq, bthd=bthd)
     dout = make_dout(real, seq, seed=seq + 1)
 
-    refs = [call(qkv, mask, dout, causal=causal, rows=False) for _ in range(3)]  # v8b
-    new = call(qkv, mask, dout, causal=causal, rows=True, idx=idx)
+    # bthd must reach call(): its default (True) transposes the leaves, which is right only for
+    # BTHD leaves. Without it the contiguous [B, H, T, D] leaves were transposed to [B, T, H, D],
+    # A1's guard saw q_len 12 != kv_len 2 and the genuine sdpa got mismatched heads (v9 Kaggle run,
+    # the 4 [*-*-False] failures): the BHTD rebuild was never exercised here.
+    refs = [call(qkv, mask, dout, causal=causal, rows=False, bthd=bthd) for _ in range(3)]  # v8b
+    new = call(qkv, mask, dout, causal=causal, rows=True, idx=idx, bthd=bthd)
     for _, _, d in refs:
         assert d["rows"] == 0 and d["rows_rebuilt"] == 0
     assert new[2]["rows"] == 1 and new[2]["rows_rebuilt"] == 1

@@ -330,10 +330,14 @@ def _gate_up_input_grad_rows(nf4, dh_box, x16, gate_proj, up_proj, bounds):
     Values. g, dx's two GEMMs and the element-wise SwiGLU backward are the operations "both" runs
     on the same operands with the same shapes; dx = fp16(du W_up) + fp16(dg W_gate) is the same
     rounded IEEE sum as "both"'s fp16(dg W_gate) + fp16(du W_up) (addition commutes). The only
-    shape change is the u GEMM (M = rows of the chunk instead of N). cuBLAS's fp16 kernels on sm_75
-    accumulate each output element over K = 1536 in the same order whatever M is unless it picks a
-    split-K or differently-blocked kernel for the smaller M; tests/test_bwd_chunking.py checks
-    torch.equal against "both" on the T4 for the run's shapes. [assumption, cuBLAS is closed source]
+    shape change is the u GEMM (M = rows of the chunk instead of N). cuBLAS picks its kernel per
+    (m, n, k), so the order in which an element of u is accumulated over K = 1536 can change with M.
+    So "rows" is NOT bit-identical to "both" in general: Kaggle T4 (31.10) gave equal bits at
+    N = 600, 1350, 1351, 1400, 2000, 2048 but not at N = 513 (chunks 384 + 129 and 256 + 257).
+    The difference is ulp-level in u, hence in dgate (dup does not read u) and dx; checks 5/6 use
+    tolerances. tests/test_bwd_chunking.py checks "rows" bit for bit against "both"'s operations
+    with u from the same per-chunk GEMMs (the chunk indexing), and against "both" itself within
+    the S4 input-gradient bound.
     """
     dh = dh_box.pop()
     x2 = x16.view(-1, x16.shape[-1])

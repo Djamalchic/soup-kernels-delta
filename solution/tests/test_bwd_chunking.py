@@ -5,10 +5,14 @@ CUDA only (Kaggle T4). Run from the repository root: python -m pytest solution -
 in tests/test_v6_apply.py (test_m5_flags_reach_the_modules, test_m5_row_bounds).
 
 What has to hold before the flag stays on:
-- S4 "rows" gives "both"'s input gradient bit for bit (torch.equal), alone, through SoupMLPRecompute
-  on [B, T, C] and through the fused block B. A failure here means cuBLAS ran the u GEMM of a
-  chunk (M = chunk rows) with other bits than the full one (M = N): then either accept ulp-level
-  gradient differences (checks 5/6 have tolerances) or set USE_BWD_CHUNKING = False.
+- S4 "rows" is NOT bit-identical to "both" in general: the u GEMM runs with M = chunk rows instead
+  of N, and cuBLAS picks its kernel per (m, n, k). Kaggle T4 (31.10): equal bits at N = 600, 1350,
+  1351, 2048 (helper), 1400 (SoupMLPRecompute on [2, 700, C]) and 1350 / 2000 (fused block B), but
+  not at N = 513 (u chunks 384 + 129 and 256 + 257). So the helper test checks (1) "rows" bit for
+  bit against "both"'s operations with u from the same per-chunk GEMMs (catches any chunk-boundary
+  bug whatever cuBLAS does per height) and (2) "rows" against "both" within the S4 input-gradient
+  bound and the LoRA-gradient bound (ulp-level drift only; checks 5/6 have tolerances). The batch-
+  shape and fused-block tests stay bit for bit at the heights measured equal above.
 - "rows" lowers the MLP backward peak by >= 90 % of W + U - max(U_c, dx) and runs 3 dequants.
 - K2 with 8192-row tiles: the same forward numbers as 16384 (loss, entropy, token losses,
   correct, labelled) bit for bit if cuBLAS's logits GEMM is N-invariant; the hidden gradient sums
@@ -20,6 +24,7 @@ import gc
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required", allow_module_level=True)
@@ -64,6 +69,54 @@ def _grad_helper(mlp, x16, dh):
         return rc._gate_up_input_grad([dh.clone()], x16, mlp.gate_proj, mlp.up_proj)
 
 
+def _both_with_chunked_u(mlp, x16, dh, bounds):
+    """"both"'s operations (mlp_recompute._gate_up_input_grad_both) with u computed by the same
+    per-chunk GEMMs F.linear(x16[r0:r1], W_up) as "rows". Every other operation keeps its full
+    shape: g and dx's two GEMMs at M = N as in "rows"; the SwiGLU backward is element-wise, so a
+    launch over all rows gives each element the bits of the per-chunk launches. "rows" must give
+    these bits exactly; a misrouted, skipped or doubled row at a chunk boundary would not."""
+    nf4 = rc._active_nf4()
+    assert nf4 is not None  # K1 installed (set_k1), as "rows" requires
+    wg_q, wu_q = mlp.gate_proj.weight, mlp.up_proj.weight
+    with torch.no_grad():
+        w_gate = nf4.nf4_dequantize(wg_q, wg_q.quant_state)
+        w_up = nf4.nf4_dequantize(wu_q, wu_q.quant_state)
+        g = F.linear(x16, w_gate)
+        u = torch.cat([F.linear(x16[r0:r1], w_up) for r0, r1 in zip(bounds[:-1], bounds[1:])])
+        dg, du = rc._swiglu_grads(dh.clone(), g, u, True)  # in place, as "both" and "rows"
+        del u
+        dx = torch.matmul(dg, w_gate)
+        dx.add_(torch.matmul(du, w_up))  # one rounded fp16 add; "rows" adds the other way round
+    return dx
+
+
+def _rel(a, b):  # tests/test_unpad.py rel(): relative error in the Frobenius norm
+    return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()
+
+
+def _assert_rows_close_to_both(got, ref, label):
+    """"rows" against "both": True when bit for bit, else (False) only ulp-level drift.
+
+    Only u's GEMM changes shape, so u differs from "both" by fp16 roundings at most; dup does not
+    read u (kernels/swiglu.py soup_swiglu_kernel: du = dh * g * s), dgate moves by the same few
+    ulps, and dx = dg W_gate + du W_up by less (and by its own final rounding). Bounds already used
+    for S4 input gradients and LoRA gradients: element-wise rtol 2e-3, atol 2e-3 * max|ref|
+    (tests/test_mlp_recompute.py test_torch_swiglu_path_close_to_k4, where dgate / dup also differ
+    by single fp16 ulps), and the relative norm within GRAD_RTOL = 2e-2 (tests/test_peak_v6.py). A
+    chunk-boundary bug moves whole rows of dx by O(1) and fails both.
+    """
+    assert got.dtype == ref.dtype and got.shape == ref.shape, label
+    if torch.equal(got, ref):
+        return True
+    diff = (got.float() - ref.float()).abs()
+    print(f"\n{label}: rows != both in {int((diff > 0).sum())} of {diff.numel()} elements, "
+          f"max {float(diff.max()):.3e}, rel {_rel(got, ref):.3e} (cuBLAS u GEMM not M-invariant)")
+    torch.testing.assert_close(got.float(), ref.float(), rtol=2e-3,
+                               atol=2e-3 * ref.float().abs().max().item(), msg=label)
+    assert _rel(got, ref) <= tp.GRAD_RTOL, label
+    return False
+
+
 # ---------------------------------------------------------------------------------------------
 # S4 helper: "rows" against "both"
 # ---------------------------------------------------------------------------------------------
@@ -71,8 +124,8 @@ def _grad_helper(mlp, x16, dh):
 @pytest.mark.parametrize("n", [513, 600, 1350, 1351, 2048])
 @pytest.mark.parametrize("chunks", [2, 4])
 @pytest.mark.parametrize("soup", [True, False])  # v8 C2's kernel (the run) / the example's
-def test_rows_helper_bit_exact_with_three_dequants(real_mlp, base_forward, monkeypatch, n, chunks,
-                                                   soup):
+def test_rows_helper_matches_both_with_three_dequants(real_mlp, base_forward, monkeypatch, n,
+                                                      chunks, soup):
     set_k1(monkeypatch, True)
     monkeypatch.setattr(k4, "USE_SOUP_SWIGLU", soup)
     torch.manual_seed(n)
@@ -85,6 +138,10 @@ def test_rows_helper_bit_exact_with_three_dequants(real_mlp, base_forward, monke
     assert len(calls) == 2  # v7 I2 "both"
 
     _rows_on(monkeypatch, chunks)
+    bounds = rc._rows_bounds(dh, x16)
+    assert bounds is not None and bounds[0] == 0 and bounds[-1] == n and len(bounds) > 2
+    assert all(b % 128 == 0 for b in bounds[1:-1])  # chunk starts on cuBLAS's 128-row tiles
+    assert all(b1 - b0 >= 128 for b0, b1 in zip(bounds[:-1], bounds[1:]))  # no tiny tail chunk
     rows_before = rc.ROWS_COUNTS["rows"]
     both_before = rc.REUSE_COUNTS["both"]
     with _count_dequants(monkeypatch) as calls:
@@ -94,10 +151,17 @@ def test_rows_helper_bit_exact_with_three_dequants(real_mlp, base_forward, monke
     assert rc.REUSE_COUNTS["both"] == both_before + 1  # still the dequant-reuse path
     assert len(calls) == 3  # W_gate twice, W_up once
     assert got.dtype == torch.float16 and got.shape == ref.shape
-    if not torch.equal(got, ref):
-        diff = (got.float() - ref.float()).abs()
-        pytest.fail(f"rows != both at n={n}, k={chunks}: {int((diff > 0).sum())} elements, "
-                    f"max {float(diff.max()):.3e} (cuBLAS u GEMM not M-invariant)")
+
+    # (1) The chunk indexing: bit for bit against "both" with u from the same per-chunk GEMMs.
+    exact = _both_with_chunked_u(real_mlp, x16, dh, bounds)
+    if not torch.equal(got, exact):
+        diff = (got.float() - exact.float()).abs()
+        bad = (diff.amax(dim=1) > 0).nonzero().view(-1)
+        pytest.fail(f"rows != both-with-chunked-u at n={n}, k={chunks}, bounds {bounds}: "
+                    f"{bad.numel()} rows differ (first {bad[:8].tolist()}), "
+                    f"max {float(diff.max()):.3e}")
+    # (2) Against "both" itself: ulp-level only (bit for bit at most heights, not at 513).
+    _assert_rows_close_to_both(got, ref, f"n={n} k={chunks} soup={soup} bounds={bounds}")
 
 
 def test_rows_helper_lowers_the_peak(real_mlp, base_forward, monkeypatch):

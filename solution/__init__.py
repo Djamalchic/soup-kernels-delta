@@ -138,7 +138,7 @@ USE_SOUP_SWIGLU = True
 # tiles 90 -> 45 MiB, backward 102 -> 57 MiB; the step's peak drops ~43 MiB (next limit: the
 # layer-27 MLP forward, ~6 MiB below). Cost ~+0.3-0.5 s per run: one more W_gate dequant per
 # chunked MLP backward, the u GEMM in pieces, 9 more K2 tiles. False = v8b exactly.
-USE_BWD_CHUNKING = True
+USE_BWD_CHUNKING = False  # M5 measured ~-30 MiB for ~+0.5 s: not worth it, and the only non-bit-exact change in v9
 BWD_ROW_CHUNKS = 4         # u recompute pieces (384-row chunks at N = 1350)
 BWD_CHUNK_MIN_ROWS = 512   # smaller batches keep "both" (not the peak; saves the extra dequant)
 K2_VOCAB_TILE = 8192
