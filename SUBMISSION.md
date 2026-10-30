@@ -2,7 +2,7 @@
 
 ## Links
 - Repository, final commit on main: https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/commit/[TODO final commit]
-  (the submitted code is v5f, commit `47a279c`, branch `v5f-candidate`, which becomes `main`: the v4 code and docs (`4f83a07`) with `USE_MLP_RECOMPUTE = True`; the final commit on main adds our README and this file. The measured reference for the same kernels is v2, `30e62a7`, branch `v2-candidate`; the S4-off alternative is v4)
+  (the submitted code is v6.1, commit `6fff364`, branch `v61-candidate`, which becomes `main`; the final commit on main adds our README and this file)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in our README):
   [TODO final link]
 - Demo video (up to 3 minutes): [TBD: link]
@@ -17,69 +17,85 @@
 | [TBD] | [TBD] | [TBD] | [TBD] | |
 
 ## Our kernels
-| Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
+| Kernel (`@triton.jit` name) | File | What it replaces | Share of training time (check 4) |
 |---|---|---|---|
-| `soup_nf4_dequant_kernel` (K1) | `solution/kernels/nf4.py` | bitsandbytes NF4 dequantization on its dequant + `F.linear` path (forward and backward re-dequant), bit-exact | [?: per-kernel share; measurements only have the combined 11.1 % at `30e62a7` and at `9fe3836`, and 10.9 % at v5f (`47a279c`), read the per-kernel breakdown of check 4 from `runs/checks.json`] |
-| `soup_head_ce_kernel` (K2) | `solution/kernels/head_ce.py` (wiring: `solution/head_loss.py`) | `lm_head` + `ForCausalLMLoss` inside `Qwen2ForCausalLM.forward`, and TRL's logits-based entropy and token-accuracy metrics in `SFTTrainer.compute_loss`; the [B, T, V] logits are never materialized, the step is handed to Soup as a `ChunkedStep` | [?: per-kernel share; measurements only have the combined share of all four kernels] |
-| `soup_addnorm_fwd_kernel`, `soup_addnorm_bwd_kernel` (K3) | `solution/kernels/addnorm.py`, wired in by `solution/layers.py` | Every `Qwen2RMSNorm` (`input_layernorm` and the final `model.norm`) forward and backward, and the first residual add of each decoder layer fused with `post_attention_layernorm`; the second residual add stays a torch add | [?: per-kernel share; measurements only have the combined share of all four kernels] |
-| All four together | | | 10.9 % at v5f (`47a279c`, submitted); 11.1 % at v4 (`9fe3836`) and at v2 (`30e62a7`), 10.7 % in the v4 final run (`c85343f`); 11.3 % at v5 (`a0d23de`) (threshold 5 %) |
+| `soup_nf4_dequant_kernel` (K1) | `solution/kernels/nf4.py` | bitsandbytes NF4 dequantization on its dequantize + `F.linear` path (forward and backward re-dequantization), bit-exact | 3.27 s GPU per run |
+| `soup_head_ce_kernel` (K2) | `solution/kernels/head_ce.py` (wiring: `solution/head_loss.py`) | `lm_head` + `ForCausalLMLoss` in `Qwen2ForCausalLM.forward`, and TRL's logits-based entropy and accuracy metrics; the [B, T, V] logits are never materialized | 0.98 s GPU per run |
+| `soup_addnorm_fwd_kernel`, `soup_addnorm_bwd_kernel` (K3) | `solution/kernels/addnorm.py` (wiring: `solution/layers.py`, `solution/fused_block.py`) | Every `Qwen2RMSNorm` forward and backward, and the first residual add of each decoder layer fused with `post_attention_layernorm` | 0.66 s GPU per run (fwd 0.37 + bwd 0.29) |
+| All four together | | | 10.6 % at v6.1 (`ebeec3a`, measured); threshold 5 % |
 
-The four kernel files are identical in v2, v4, v5 and v5f (`git diff --stat 30e62a7 9fe3836` lists only `unpad.py`, `mlp_recompute.py` and test files; v5f differs from v4 only by the S4 flag).
+v6.1 adds no new Triton kernel. K3's two kernels got new runtime options for B: an fp16 pointer for the attention output, a flag that skips the store of the fp32 sum, and a flag that rebuilds it in backward. `nf4.py` is unchanged from v5f (`git diff --stat 47a279c 6fff364 -- solution/kernels/` lists only `addnorm.py` and `head_ce.py`).
 
-Not counted as ours: the starter kit's example SwiGLU kernel, which `solution/mlp.py` (K4) calls inside an fp16 Qwen2 MLP. K4 saves memory by keeping gate and up in fp16 instead of fp32. The matmul results are the same, and the SiLU(gate) * up result is rounded to fp16 at the same point as in the base. The tests in `solution/tests/test_mlp.py` match the base `Qwen2MLP` within rtol = atol = 2e-3 but do not check bit identity.
+Not counted as ours: the starter kit's example SwiGLU kernels, called by K4 (`solution/mlp.py`), by S4's backward and, in place, by C.
 
-Non-kernel changes (no Triton kernel in either):
-- U, `solution/unpad.py`: the RMSNorms, the residual adds and the MLP run on the real tokens only; attention keeps [B, T, C], so the LoRA dropout masks and the RNG state match the base. On in v4 and v5f.
-- S4, `solution/mlp_recompute.py`: controlled by one flag, `USE_MLP_RECOMPUTE` in `solution/__init__.py`, True in the submitted v5f. When on, the MLP saves only its fp16 input and recomputes gate and up in backward; by design the outputs and input gradients are bit-identical to K4 (the tests check `torch.equal`; at v4, `pytest solution -q` on the T4 reports no failure in that file: 195 passed, 7 failed, all 7 in `test_unpad.py`; at v5f, 203 passed). This is our own autograd recompute inside our MLP path, not Soup's `gradient_checkpointing` mode, which stays off. Measured with the flag on in the jury-style run as v5f (`47a279c`): 66.9 s and 3,845 MiB (s = 1.192, m = 3.731), all 10 checks passed. We submit v5f because it cuts peak memory further (3,845 MiB) while staying 1.19x faster than the base; S4 can be switched off with one flag (`USE_MLP_RECOMPUTE`) for the 1.30x / 5,025 MiB trade-off (v4).
+Non-kernel changes (no Triton kernel in any of them):
+- U, `solution/unpad.py`: RMSNorms, residual adds and the MLP run on the real tokens only; attention keeps [B, T, C], so the LoRA dropout masks and RNG state match the base.
+- K4, `solution/mlp.py`: fp16 MLP path; autograd keeps gate and up in fp16 instead of three fp32 tensors per layer.
+- S4, `solution/mlp_recompute.py`, flag `USE_MLP_RECOMPUTE`: the MLP saves only its fp16 input and recomputes gate and up in backward, bit-identical to K4. Our own autograd recompute, not Soup's `gradient_checkpointing`, which stays off. Saves 1,180 MiB, costs about 5.4 s (v4 against v5f, different sessions).
+- B, `solution/fused_block.py`, flag `USE_FUSED_BLOCK`: add + norm + S4 MLP + add as one autograd node saving (r, fp16 a, rstd). Estimated saving 213 MiB [estimate].
+- A1, `solution/sdpa_recompute.py`, flag `USE_SDPA_RECOMPUTE`: attention saves fp16 q and un-repeated k and v and recomputes torch's SDPA in backward. Estimated saving 507 MiB [estimate].
+- A2, `solution/lora_replay.py`, flag `USE_LORA_DROPOUT_REPLAY`: LoRA dropout saves the generator state, not the mask. Estimated saving 162 MiB [estimate].
+- D, `solution/saved_compact.py`, flag `USE_LORA_ROW_COMPACT`: LoRA-A inputs keep the real rows only (public `saved_tensors_hooks`, nothing offloaded). Estimated saving 115 MiB [estimate].
+- C, `solution/mlp_recompute.py`, flag `INPLACE_SWIGLU_BACKWARD`: the example backward kernel writes over its own inputs. Estimated saving 16 MiB [estimate].
+- Switched off, not used in any measured run: `STORE_HEAD_FP16` and `USE_SDPA_KV_COMPACT`.
 
-Ideas taken from other kernels, with links (we wrote the code ourselves):
-- bitsandbytes: NF4 format, double quantization layout and rounding order, and the tile idea of K1 v3s (one absmax per thread, one packed byte gives two outputs) after its `kDequantizeBlockwise` kernel; idea only, our own code (K1). https://github.com/bitsandbytes-foundation/bitsandbytes
-- Soup issue #1693: the `ChunkedStep` protocol for a step without logits, defined in `soup_cli/utils/stream_loss_chunk.py` of soup-cli 0.77.0 (K2). Soup repository (from the starter kit README): https://github.com/MakazhanAlpamys/Soup. Issue link: [?: probably https://github.com/MakazhanAlpamys/Soup/issues/1693; page not opened]
-- Liger-Kernel: fused linear + cross entropy and fused add + RMSNorm, idea only, no code and no import (K2, K3). https://github.com/linkedin/Liger-Kernel
-- Unsloth: fused add + RMSNorm, idea only, no code and no import (K3). Link: [?: probably https://github.com/unslothai/unsloth; not in our files]
-- Apple Cut Cross-Entropy: cross entropy without full logits, idea only, no code and no import (K2). https://github.com/apple/ml-cross-entropy
-- Online softmax (Milakov & Gimelshein, 2018, "Online normalizer calculation for softmax"): running max and sum of exponentials over vocabulary tiles, idea only (K2). Link: [?: probably https://arxiv.org/abs/1805.02867; not in our files]
-- ByteDance Effective Transformer and the "unpad" path of FlashAttention's varlen BERT: removing padding for token-wise ops, idea only, no code (U). Link: [?: probably https://github.com/bytedance/effective_transformer; not in our files]
-- Chen et al. 2016, "Training Deep Nets with Sublinear Memory Cost": activation recomputation (S4). https://arxiv.org/abs/1604.06174
-- Starter kit example SwiGLU: used as is inside K4 (`solution/swiglu.py` is the example file unchanged; K4 calls its function directly).
+Ideas taken from other work (we wrote the code ourselves; none of the banned libraries is imported):
+- bitsandbytes: NF4 format, double quantization layout, rounding order, tile idea of `kDequantizeBlockwise` (K1). https://github.com/bitsandbytes-foundation/bitsandbytes
+- Soup issue #1693 and the `ChunkedStep` protocol in `soup_cli/utils/stream_loss_chunk.py` of soup-cli 0.77.0 (K2). Soup repository: https://github.com/MakazhanAlpamys/Soup. Issue: #1693 in that repository.
+- Liger-Kernel: fused linear + cross entropy, fused add + RMSNorm (K2, K3, B), idea only. https://github.com/linkedin/Liger-Kernel
+- Unsloth: fused add + RMSNorm (K3, B), idea only. https://github.com/unslothai/unsloth
+- Apple Cut Cross-Entropy: cross entropy without full logits (K2), idea only. https://github.com/apple/ml-cross-entropy
+- Online softmax, Milakov and Gimelshein 2018 (K2). https://arxiv.org/abs/1805.02867
+- ByteDance Effective Transformer and the unpad path of FlashAttention's varlen BERT: removing padding (U). https://github.com/bytedance/effective_transformer
+- Chen et al. 2016, "Training Deep Nets with Sublinear Memory Cost": activation recomputation (S4, B, A1). https://arxiv.org/abs/1604.06174
+- FlashAttention, Dao et al. 2022: recompute attention intermediates in backward (A1), idea only. https://arxiv.org/abs/2205.14135
+- Korthikanti et al. 2022, "Reducing Activation Recomputation in Large Transformer Models": selective recomputation (A1). https://arxiv.org/abs/2205.05198
+- `torch.utils.checkpoint` (`preserve_rng_state`) and the Megatron-LM CUDA RNG tracker: restoring the generator state (A2), idea only.
+- Starter kit example SwiGLU: called, not copied (K4, S4, C).
 
-AI assistants: ChatGPT (GPT-6-Astra) and Claude were used as coding assistants, as the rules allow. The four Triton kernels in v5f are the ones run with `pytest solution -q` and measured on a Kaggle T4 in v2, in v4 and again in v5f. K1 v3s went through a Kaggle microbenchmark (`672d725`) before it entered `solution/`.
+AI assistants: ChatGPT (GPT-6-Astra) and Claude were used as coding assistants, as the rules allow. Every Triton kernel was run with `pytest solution -q` and measured on a Kaggle T4. K1 v3s went through a Kaggle microbenchmark before it entered `solution/`. Drafts of several components were written by both assistants in parallel and compared; the chosen version was reviewed against the library sources and measured on Kaggle.
 
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
-Final jury-style run of the submitted v5f (`47a279c`, `--repeats 2`: base, solution, solution, base): base 79.8 s (76.72 and 82.78) / 14,345 MiB, ours 66.9 s (65.38 and 68.39) / 3,845 MiB, s = 1.192, m = 3.731, all 10 checks pass, `pytest solution -q` 203 passed. v5f is the v4 code with S4 on. v4 reproduces v2 (`30e62a7`, same four Triton kernels and same K4): 61.22 to 60.76 s, the same peak. The v2 row stays in the ablation as history.
+Jury-style run of v6.1 (`--repeats 2`: base, solution, solution, base; notebook version 3, `COMMIT = ebeec3a`). The submitted `6fff364` differs from `ebeec3a` in one test tolerance (the LoRA-A gradient bound in `test_v6_merged`); the training code is the same.
 
-| | Base Soup | Ours (v5f) | Ratio |
+| | Base Soup | Ours (v6.1) | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 79.8 | 66.9 | s = 1.192: 1.19x speedup, wall time 16.2 % shorter |
-| Peak GPU memory, MiB | 14,345 | 3,845 | base/ours m = 3.731: 73 % less peak memory |
-| Eval loss (public rows) | 2.04969 | 2.04962 | -0.003 % vs base |
+| Time of `soup train`, s | 90.2 (91.62 and 88.83) | 74.5 (74.85 and 74.15) | s = 1.211: wall time 17.4 % shorter |
+| Peak GPU memory, MiB | 14,345 | 2,827 | m = 5.074: 80 % less |
+| Eval loss (public rows) | 2.04966 | 2.04968 | +0.001 % |
+| Share of own kernels (check 4) | n/a | 10.6 % | threshold 5 % |
 
-The v4 alternative (S4 off, `--repeats 2` at `c85343f`): base 79.8 s, ours 61.5 s, s = 1.298, 5,025 MiB (m = 2.855), eval loss -0.001 %, all 10 checks pass, kernel share 10.7 %.
+Earlier versions and one later one, each against the base of its own session (base times differ by session, compare s and m):
 
-Ablation (against the base of the same session; one repeat each except the last two rows, which are `--repeats 2`):
+| Version | Base, s | Ours, s | Peak, MiB | s | m |
+|---|---|---|---|---|---|
+| Base Soup 0.77.0 | n/a | n/a | 14,345 | 1.000 | 1.000 |
+| K1 v1 + K4 (`a2c85c6`) | 84.96 | 82.55 | 10,383 | 1.029 | 1.382 |
+| v1 = + K3 + K2 (`c2b1ff1`) | 78.22 | 72.54 | 5,845 | 1.078 | 2.454 |
+| v2 = K1 v3s + U (`30e62a7`) | 77.06 | 61.22 | 5,025 | 1.259 | 2.855 |
+| v4, S4 off (`c85343f`, `--repeats 2`) | 79.8 | 61.5 | 5,025 | 1.298 | 2.855 |
+| v5f, S4 on (`47a279c`, `--repeats 2`) | 79.8 | 66.9 | 3,845 | 1.192 | 3.731 |
+| v6 (`df2557b`) | 84.8 | out of memory at step 22 of 64 | 14,903 | n/a | n/a |
+| **v6.1 (`6fff364`, measured at `ebeec3a`, `--repeats 2`)** | 90.2 | 74.5 | 2,827 | 1.211 | 5.074 |
+| v7 (`cb7d630`, `--repeats 2`, not submitted) | 84.1 | 65.1 | 3,233 | 1.292 | 4.437 |
 
-| Version | Time, s | Peak, MiB | s | m |
-|---|---|---|---|---|
-| Example SwiGLU only | 83.05 (base 77.83) | 12,385 | 0.937 | 1.158 |
-| K1 + K4 | 82.55 (base 84.96) | 10,383 | 1.029 | 1.382 |
-| v1 = K1 + K4 + K3 + K2 | 72.54 (base 78.22) | 5,845 | 1.078 | 2.454 |
-| v2 = + K1 v3s + unpadding (`30e62a7`) | 61.22 (base 77.06) | 5,025 | 1.259 | 2.855 |
-| v4 = v2 + final U + test fixes, S4 off (`9fe3836`) | 60.76 (base 77.77) | 5,025 | 1.280 | 2.855 |
-| v5 = v4 + S4 on (`a0d23de`, ablation) | 65.7 (base 77.6) | 3,845 | 1.182 | 3.731 |
-| v4 final run, S4 off (`c85343f`, speed-oriented alternative) | 61.5 (base 79.8) | 5,025 | 1.298 | 2.855 |
-| v5f = v4 + S4 on (`47a279c`, submitted) | 66.9 (base 79.8) | 3,845 | 1.192 | 3.731 |
+What went wrong in v6: both solution runs died at step 22 of 64 with "GPU ran out of memory". Memory grew by about 0.5 GB per step. A1's forward builds a throw-away SDPA graph that never gets a backward, and D's pack hook returned saved tensors as they were, so SDPA's own outputs were stored together with the node that owns them: a reference cycle that only that backward breaks. v6.1 runs A1's inner calls under private hooks, makes D's hooks return `t.detach()`, and adds `solution/tests/test_v6_no_leak.py` (flat memory over 8 training steps). The fix was confirmed on Kaggle: v6.1 ran all 64 steps at a flat 2,827 MiB peak.
 
-- [x] All 10 checks of `harness/check_rules.py` passed at v5f (`47a279c`: check 4 share 10.9 %, check 6 0.00 to 0.01 %, check 7 eval loss -0.003 %, check 8 time x0.839 and memory x0.268 of the base, check 9 clean, check 10 79 passed). They also passed at v4 (`9fe3836`: check 4 share 11.1 %, check 6 0.01 % first step and 0.01 % mean, check 8 time x0.781 and memory x0.350; final run `c85343f`: check 4 10.7 %, check 8 time x0.771 and memory x0.350), at `30e62a7` (check 4 11.1 %, check 8 time x0.794 and memory x0.350) and at `a0d23de` (check 4 11.3 %, check 8 time x0.846 and memory x0.268).
+Tried after v6.1: v7 (`cb7d630`, branch `v7-candidate`) adds causal SDPA in A1 (I1), one dequantization in S4 backward (I2), a K1 host fast path with a permanent fp16 cache of the k and v weights (I3), and S4 off on 7 of 28 layers (I4). It measured s = 1.292 and m = 4.437 (3,233 MiB), and all 10 checks passed. We kept v6.1 for the lower peak.
+
+- [x] All 10 checks of `harness/check_rules.py` passed at v6.1 (`ebeec3a`): check 4 share 10.6 %, check 6 0.00 to 0.01 %, check 7 eval loss +0.001 %, check 8 time x0.826 and memory x0.197 of the base, check 9 clean, check 10 79 passed.
 - [x] README.md for our solution (what we did, how to run it, results, limits).
 
 ## Presentation covers
-Which operations we sped up and why (NF4 dequantization, fp32 elementwise ops and norms, the full-vocabulary logits, and the fp32 MLP activations that dominate the peak), how K1 to K4, U and S4 (on in v5f, one flag switches it off) work, results against the base (speed, memory, quality) and the limits and next steps.
+Which operations we sped up and why (NF4 dequantization, fp32 elementwise ops and norms, padding, the full-vocabulary logits, the fp32 MLP activations, and the per-layer attention and LoRA activations that dominate the rest of the peak), how K1 to K4, U, S4, B, A1, A2, D and C work, the v6 memory leak and its fix, results against the base (speed, memory, quality) and the limits.
 
 ## Limitations
-- The final run of the submitted v5f used `--repeats 2` like the jury: base 79.8 s, ours 66.9 s, s = 1.192, m = 3.731, eval loss -0.003 %, all 10 checks pass, kernel share 10.9 %. The v4 final run (`c85343f`, S4 off) also used `--repeats 2`: base 79.8 s, ours 61.5 s, s = 1.298, m = 2.855, eval loss -0.001 %, kernel share 10.7 %. Our base runs ranged from 77.06 to 84.96 s across sessions, so s is only meaningful against the base of the same session.
-- Compile cost is part of the wall time because the Triton cache is empty in every run. We have not split compile time from kernel time yet [TODO].
-- K4 relies on the example kernel for SiLU(gate) * up. It is not counted as our kernel.
-- Our own test suite at `30e62a7`: 136 passed, 27 failed, 23 of them an import error in `test_unpad.py` caused by the Kaggle image's old torchao and PEFT 0.20, the rest 4 older test problems. They do not affect the training run (checks 5 to 10 pass). The 4 older ones were fixed in `2bef7a3`, the ImportError behind the 23 in `9fe3836` (v4). At `a0d23de` the output was not read to the end and at least one `test_unpad.py` gradient-tolerance failure was still visible (0.0038 against 0.002); `unpad.py` and its test are the same in v4. At v4 (`9fe3836`), `pytest solution -q` gave 195 passed and 7 failed, all 7 in `test_unpad.py`: six on the `layers.0.self_attn.q_proj.lora_A` gradient tolerance (0.0038 against 0.002) and `test_pack_unpack_roundtrip_and_gradients`. The 4 older failures and the torchao ImportError are fixed. The 7 were test-side problems and were fixed in `c85343f`: the pack/unpack test took its RNG snapshot before drawing its random inputs, and the LoRA-gradient comparisons ran without a loss scale, so fp16 subnormals dominated the relative error; the tests now scale the loss by 2**16 as GradScaler does (tolerance derived in a comment) and a negative test checks that misrouted row gradients are caught. At `c85343f`, `pytest solution -q` gave 203 passed, 0 failed; at the submitted v5f (`47a279c`) it gave 203 passed.
-- Built and measured for Soup's T4 fp16 path only; Qwen2 only. K2 and U check the exact Qwen2 classes. S4 (on in v5f, off in v4) is installed only on `Qwen2MLP.forward` and checks K4's conditions (exact bitsandbytes `Linear4bit` layers with fp16 compute dtype), not the `Qwen2MLP` type. K1, K4 and S4 fall back unless the 4-bit layers compute in fp16. K2 falls back for other models and for dtypes other than fp16 autocast, but does not check the GPU model. K3 needs no particular GPU model: it runs on any CUDA GPU with an fp32 residual stream of width 1536 (Qwen2.5-1.5B) and frozen fp32 norm weights, and other dtypes, widths, CPU tensors and other models fall back. U checks neither the GPU model nor the dtype, so on another CUDA GPU with SDPA attention it still takes its fast path. Other GPUs are not tested.
-- The submitted v5f was measured as a whole. Its code is v4's with S4 on, and v4's final U differs from the U in v2. v4 reproduces v2 (61.22 to 60.76 s, the same peak).
-- Next steps: split compile time from kernel time.
+- Measured with `--repeats 2` like the jury, but our base ran 77 to 92 s across sessions, so s is meaningful only against the base of the same session. v5f and v6.1 were not run in the same session.
+- The run is from `ebeec3a`; the submitted `6fff364` differs in one test tolerance. We have not measured `6fff364` as such.
+- The savings of B, A1, A2, D and C are estimates; only their sum is measured (the peak).
+- `pytest solution -q` at `ebeec3a`: 285 passed, 1 failed (LoRA-A gradient tolerance in `test_v6_merged`, a wrong test bound; fixed in `6fff364` to the derived bound of 2e-2). Final count: [tests: TODO final count]. The training run passed all 10 checks.
+- A1 relies on torch's SDPA backward, which may not be deterministic on a T4. K3's fp16-pointer variant changes the normalized output by a few fp32 ulp against v5f; the 2e-6 test tolerance is an estimate. Eval loss is within +0.001 % of the base.
+- In the v6.1 profile about 180 ms of each 0.72 s step was GPU idle, mostly Soup and Trainer host work. `apply()` takes about 7.5 s and the first step, with Triton compilation, 4.9 s; the Triton cache is empty in every run.
+- K4, S4 and C rely on the example kernels for SiLU(gate) * up and its backward; they are not counted as ours.
+- Built and measured for Soup's T4 fp16 path and Qwen2 only. Guards check classes, dtypes and shapes, mostly not the GPU model; where Soup picks bf16, K1, K4, S4 and B fall back to the original code. Other GPUs are not tested.
+- Next steps: record the final test count at `6fff364`; split the per-kernel share of check 4.
