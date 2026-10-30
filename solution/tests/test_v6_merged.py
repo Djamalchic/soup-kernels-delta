@@ -95,7 +95,7 @@ def v6_patches(forwards, monkeypatch):
     monkeypatch.setattr(sc, "USE_SDPA_KV_COMPACT", False)
     for mod, flag in ((sc, "USE_LORA_ROW_COMPACT"), (fb, "USE_FUSED_BLOCK"),
                       (a1, "USE_SDPA_RECOMPUTE"), (a2, "USE_LORA_DROPOUT_REPLAY"),
-                      (a1, "USE_CAUSAL_PADDED")):
+                      (a1, "USE_CAUSAL_PADDED"), (a1, "USE_ROW_COMPACT")):  # v9 M3 restored too
         monkeypatch.setattr(mod, flag, getattr(mod, flag))
     yield patched
     a1.unpatch_sdpa_recompute()

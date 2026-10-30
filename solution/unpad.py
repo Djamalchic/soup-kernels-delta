@@ -401,6 +401,15 @@ def _attention_scope(idx, batch, seq, width):
     return contextlib.nullcontext()
 
 
+def _lora_source_scope(norm, r, x_bt, idx):
+    """v9 M2: solution/lora_recompute.py source_scope when its flag is on, else a no-op context.
+    The scope runs its own guards (reads only) and is a no-op when they fail."""
+    m2 = _REFS.get("lora_recompute")
+    if m2 is None or not m2.USE_LORA_INPUT_RECOMPUTE:
+        return contextlib.nullcontext()
+    return m2.source_scope(norm, r, x_bt, idx, _REFS["norm_cls"])
+
+
 def _causal_scope(mask, batch, seq):
     """v7 I1: solution/sdpa_recompute.py causal_mask_scope(mask) when A1's USE_CAUSAL_PADDED is on
     and `mask` provably is causal AND (validated right-) padding, else a no-op context. Reads only.
@@ -412,18 +421,42 @@ def _causal_scope(mask, batch, seq):
     496-518; no packed-sequence mask with a 2D mask, :851-857). Both functions must be the genuine
     ones, and the result a [B, 1, T, T] bool tensor (no skip to None)."""
     a1 = _REFS.get("sdpa_recompute")
-    mu = _REFS.get("masking")
-    if a1 is None or mu is None or not getattr(a1, "USE_CAUSAL_PADDED", False):
+    if a1 is None or not getattr(a1, "USE_CAUSAL_PADDED", False):
         return contextlib.nullcontext()
+    if not _causal_padding_mask(mask, batch, seq):
+        return contextlib.nullcontext()
+    return a1.causal_mask_scope(mask)
+
+
+def _causal_padding_mask(mask, batch, seq):
+    """True when `mask` provably is causal AND padding (provenance in _causal_scope). Reads only."""
+    mu = _REFS.get("masking")
+    if mu is None:
+        return False
     try:
-        ok = (isinstance(mask, torch.Tensor) and mask.dtype == torch.bool
-              and tuple(mask.shape) == (batch, 1, seq, seq)
-              and _REFS["modeling"].create_causal_mask is mu.create_causal_mask
-              and mu.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] is mu.sdpa_mask
-              and mu.causal_mask_function is _REFS.get("causal_mask_function"))
+        return bool(isinstance(mask, torch.Tensor) and mask.dtype == torch.bool
+                    and tuple(mask.shape) == (batch, 1, seq, seq)
+                    and _REFS["modeling"].create_causal_mask is mu.create_causal_mask
+                    and mu.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] is mu.sdpa_mask
+                    and mu.causal_mask_function is _REFS.get("causal_mask_function"))
     except Exception:  # noqa: BLE001
-        ok = False
-    return a1.causal_mask_scope(mask) if ok else contextlib.nullcontext()
+        return False
+
+
+def _row_scope(mask, idx, batch, seq):
+    """v9 M3: solution/sdpa_recompute.py row_compact_scope(mask, idx, batch, seq) when A1's
+    USE_ROW_COMPACT is on and `mask` provably is causal AND padding, else a no-op context.
+
+    A1 may then keep q/k/v of the real rows only: on this path every pad query row's output is
+    dropped by pack_rows after self_attn (its dO is exactly 0) and, with this mask or I1's causal
+    call on right-padded rows, no real query sees a pad key (proof in sdpa_recompute.py). Reads
+    only; the scope makes its two [N] index vectors lazily, inside A1's guarded call."""
+    a1 = _REFS.get("sdpa_recompute")
+    if a1 is None or not getattr(a1, "USE_ROW_COMPACT", False):
+        return contextlib.nullcontext()
+    if not _causal_padding_mask(mask, batch, seq):
+        return contextlib.nullcontext()
+    return a1.row_compact_scope(mask, idx, batch, seq)
 
 
 def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3,
@@ -437,7 +470,10 @@ def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, 
     x_bt = unpack_rows(x, idx, batch, seq)  # exact zeros on the padding rows
     del x
     # v6 A + D (solution/saved_compact.py): smaller saved tensors inside attention, same values.
-    with _attention_scope(idx, batch, seq, x_bt.shape[-1]):
+    # v9 M2 (solution/lora_recompute.py): LoRA layers fed exactly x_bt keep no LoRA-A input and
+    # rebuild it from r in backward (entered second, so its lora_A hooks are the innermost).
+    with _attention_scope(idx, batch, seq, x_bt.shape[-1]), \
+            _lora_source_scope(layer.input_layernorm, r, x_bt, idx):
         a_bt, _ = layer.self_attn(  # lines 282-290: the same arguments and kwargs, base shapes
             hidden_states=x_bt,
             attention_mask=mask,
@@ -497,7 +533,8 @@ def _packed_forward(model, input_ids, attention_mask, idx, use_cache, kwargs, mo
         k3 = _k3_ops() if mode == "k3" else None
         n_layers = model.config.num_hidden_layers
         n_off = s4_off_count(n_layers)  # v7 I4: the first n_off layers keep gate/up (no S4)
-        with _causal_scope(mask, batch, seq):  # v7 I1: SDPA may take is_causal=True for this mask
+        # v7 I1: SDPA may take is_causal=True for this mask; v9 M3: A1 may save real rows only.
+        with _causal_scope(mask, batch, seq), _row_scope(mask, idx, batch, seq):
             for i, layer in enumerate(model.layers[:n_layers]):  # line 387
                 r = _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache,
                                   kwargs, k3, s4_off=i < n_off)
@@ -577,7 +614,7 @@ def patch_qwen2_model_unpad():
                                                             "Qwen2DecoderLayer.forward") else None))
     # v6 helpers (pure Python, no CUDA at import); missing ones just keep v5's ops.
     for key, name in (("fused_block", "fused_block"), ("saved_compact", "saved_compact"),
-                      ("sdpa_recompute", "sdpa_recompute")):
+                      ("sdpa_recompute", "sdpa_recompute"), ("lora_recompute", "lora_recompute")):
         try:
             refs[key] = importlib.import_module(f"{__package__}.{name}")
         except Exception:  # noqa: BLE001

@@ -62,7 +62,13 @@ IGNORE_INDEX = -100
 # fp16 weight tile 16384 x 1536 = 48 MiB (none with an fp16 head), logits tile <= 2048 x 16384
 # fp16 = 64 MiB. v6 keeps v5's 16384 (the GEMM shapes validated on Kaggle): K2 is not the moment
 # of the step's memory peak, so a smaller tile would not lower it.
-VOCAB_TILE = 16384
+# v9 M5 (USE_BWD_CHUNKING): once the S4 backward is row-chunked, K2's buffers would set the step's
+# peak (forward: 12 MiB hidden + 4 MiB h16 + 48 + 42 MiB tiles at 1350 real rows; backward: 48 + 42
+# + 4 + 8), so apply() sets K2_VOCAB_TILE = 8192 (151936 = 18 * 8192 + 4480: 19 tiles; the same
+# last tile and n_cols divisible by 16, so the same compiled variant). Weight tile 24 MiB, logits
+# tile 21 MiB at 1350 rows. Read at every call by _tiles / _weight_tiles (forward and backward).
+VOCAB_TILE_V8 = 16384
+VOCAB_TILE = VOCAB_TILE_V8
 # Columns per inner iteration (and elements per program in mode 2): 2048 fp32 values over 8 warps
 # is 8 per thread, no spills expected on sm_75 (check `n_spills` of the compiled kernel on Kaggle).
 BLOCK_V = 2048

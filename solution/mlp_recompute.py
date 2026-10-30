@@ -38,8 +38,17 @@ forward's SwiGLU run our soup_swiglu_kernel (solution/kernels/swiglu.py: forward
 same in-place backward) instead of the example's kernels. Same values; the example code below stays
 as the flag-off path.
 
+v9 M5 (BWD_ROW_CHUNKS > 1, set by apply() from USE_BWD_CHUNKING): on the "both" path the backward
+keeps one dense weight at a time and recomputes u in row chunks (_gate_up_input_grad_rows). Per
+MLP backward at N rows (U = N x 8960 fp16, W = one dense [8960, 1536] fp16 weight, 26.25 MiB):
+"both" holds dh, g, u, W_gate, W_up = 3U + 2W at the recompute of u; "rows" holds dh, g, W_up and
+one u chunk = 2U + W + U/k. At N = 1350, k = 4 (384-row chunks): 121.7 -> 78.9 MiB of transients.
+Cost: W_gate is dequantized twice (3 dequants instead of 2) and the u GEMM runs in k pieces.
+
 Idea credit: activation recomputation, Chen et al. 2016, "Training Deep Nets with Sublinear Memory
-Cost" (arXiv:1604.06174). The code is our own. No Triton kernel lives in this file.
+Cost" (arXiv:1604.06174); row-chunked MLP passes are a common trick (e.g. Liger-Kernel's chunked
+fused-linear losses, Unsloth's chunked MLP); no code taken. The code is our own. No Triton kernel
+lives in this file.
 """
 
 import sys
@@ -73,6 +82,15 @@ INPLACE_SWIGLU_BACKWARD = True
 # code runs and REUSE_COUNTS["fallback"] counts it. apply() sets this (solution/__init__.py).
 S4_DEQUANT_REUSE = "off"
 REUSE_COUNTS = {"both": 0, "up": 0, "fallback": 0}
+# v9 M5: row chunks for the recompute of u on the "both" path (_gate_up_input_grad_rows). 1 (the
+# module default) is v7 I2's "both" unchanged; apply() writes it. Chunks start at multiples of
+# BWD_ROW_ALIGN rows (cuBLAS's 128-row tiles: the k pieces cover as many tiles as the full GEMM),
+# and batches under BWD_CHUNK_MIN_ROWS rows keep "both" (they are not the step's memory peak).
+# A rows call is also counted as "both" in REUSE_COUNTS (it is the same dequant-reuse path).
+BWD_ROW_CHUNKS = 1
+BWD_CHUNK_MIN_ROWS = 512
+BWD_ROW_ALIGN = 128
+ROWS_COUNTS = {"rows": 0}
 
 _PATCH_MARK = "_soup_delta_mlp_recompute"
 _PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")
@@ -263,6 +281,87 @@ def _gate_up_input_grad_both(nf4, dh_box, x16, gate_proj, up_proj):
     return dx
 
 
+def _rows_bounds(dh, x16):
+    """Chunk boundaries [0, b1, ..., N] for _gate_up_input_grad_rows, or None ("both" runs).
+
+    Needs dh and x16 contiguous fp16 with the same leading shape (so both flatten to [N, .] views
+    without a copy) and N >= BWD_CHUNK_MIN_ROWS. Step: ceil(N / k) rounded up to BWD_ROW_ALIGN,
+    so every chunk but the last starts and ends on a cuBLAS tile boundary; a last piece shorter
+    than BWD_ROW_ALIGN is merged into the one before (no tiny-M GEMM, which cuBLAS may run with
+    another kernel). One chunk left means no chunking: None.
+    """
+    k = BWD_ROW_CHUNKS
+    if type(k) is not int or k < 2:
+        return None
+    if not (isinstance(dh, torch.Tensor) and isinstance(x16, torch.Tensor)):
+        return None
+    if dh.dtype != torch.float16 or x16.dtype != torch.float16 or x16.dim() < 2:
+        return None
+    if dh.dim() != x16.dim() or dh.shape[:-1] != x16.shape[:-1]:
+        return None
+    if not (dh.is_contiguous() and x16.is_contiguous()) or dh.device != x16.device:
+        return None
+    n = x16.numel() // max(x16.shape[-1], 1)
+    min_rows = BWD_CHUNK_MIN_ROWS if type(BWD_CHUNK_MIN_ROWS) is int else 512
+    if n < max(min_rows, k):
+        return None
+    align = BWD_ROW_ALIGN if type(BWD_ROW_ALIGN) is int and BWD_ROW_ALIGN > 0 else 1
+    step = -(-n // k)
+    step = -(-step // align) * align
+    bounds = list(range(0, n, step)) + [n]
+    if len(bounds) > 2 and bounds[-1] - bounds[-2] < align:
+        del bounds[-2]
+    return bounds if len(bounds) > 2 else None
+
+
+def _gate_up_input_grad_rows(nf4, dh_box, x16, gate_proj, up_proj, bounds):
+    """v9 M5: "both" with one dense weight alive at a time and u recomputed in row chunks.
+
+    Order (N rows; U = an [N, 8960] fp16 buffer, W = a dense [8960, 1536] fp16 weight):
+      1. W_gate; g = F.linear(x16, W_gate) over all N rows (the forward's GEMM, M = N); free W_gate.
+      2. W_up; per chunk c: u_c = F.linear(x16[c], W_up); SwiGLU backward in place:
+         dg_c over dh[c], du_c over g[c] (the same kernel and arguments as "both", on row slices
+         that start 16-byte aligned: 8960 * 2 and 1536 * 2 bytes per row); free u_c.
+      3. dx = du @ W_up over all N rows (M = N, as "both"); free g (= du) and W_up.
+      4. W_gate again; dx += dg @ W_gate (M = N, as "both").
+    Peak: dh + g + W_up + u_c = 2U + W + U/k (+ dx at step 3: 2U + W + N x 1536 x 2), instead of
+    "both"'s dh + g + u + W_gate + W_up = 3U + 2W. One more W_gate dequant per call.
+
+    Values. g, dx's two GEMMs and the element-wise SwiGLU backward are the operations "both" runs
+    on the same operands with the same shapes; dx = fp16(du W_up) + fp16(dg W_gate) is the same
+    rounded IEEE sum as "both"'s fp16(dg W_gate) + fp16(du W_up) (addition commutes). The only
+    shape change is the u GEMM (M = rows of the chunk instead of N). cuBLAS's fp16 kernels on sm_75
+    accumulate each output element over K = 1536 in the same order whatever M is unless it picks a
+    split-K or differently-blocked kernel for the smaller M; tests/test_bwd_chunking.py checks
+    torch.equal against "both" on the T4 for the run's shapes. [assumption, cuBLAS is closed source]
+    """
+    dh = dh_box.pop()
+    x2 = x16.view(-1, x16.shape[-1])
+    d2 = dh.view(-1, dh.shape[-1])
+    w_gate_q, w_up_q = gate_proj.weight, up_proj.weight
+    with torch.autocast(x16.device.type, enabled=False):  # as in _gate_up_input_grad_both
+        w = nf4.nf4_dequantize(w_gate_q, w_gate_q.quant_state)
+        g = F.linear(x2, w)
+        del w
+        w = nf4.nf4_dequantize(w_up_q, w_up_q.quant_state)
+        for r0, r1 in zip(bounds[:-1], bounds[1:]):
+            u = F.linear(x2[r0:r1], w)
+            dh_c, g_c = d2[r0:r1], g[r0:r1]
+            dg, du = _swiglu_grads(dh_c, g_c, u, True)
+            del u
+            if dg is not dh_c:  # out-of-place fallback (torch SwiGLU or a refused in-place call)
+                dh_c.copy_(dg)
+            if du is not g_c:
+                g_c.copy_(du)
+            del dg, du, dh_c, g_c
+    dx = torch.matmul(g, w)  # du @ W_up: g's buffer holds du now
+    del g, w
+    w = nf4.nf4_dequantize(w_gate_q, w_gate_q.quant_state)
+    dx.add_(torch.matmul(d2, w))  # + dg @ W_gate: dh's buffer holds dg
+    del w, d2, dh
+    return dx.view(*x16.shape[:-1], dx.shape[-1])
+
+
 def _gate_up_input_grad_up(nf4, dh_box, x16, gate_proj, up_proj, g_saved):
     """"up": W_up dequantized once and kept for dx; gate exactly as in v6.1. Same bits."""
     dh = dh_box.pop()
@@ -293,6 +392,10 @@ def _gate_up_input_grad(dh_box, x16, gate_proj, up_proj, g_saved=None):
         if nf4 is not None:
             REUSE_COUNTS[mode] += 1
             if mode == "both":
+                bounds = _rows_bounds(dh_box[0], x16)  # v9 M5
+                if bounds is not None:
+                    ROWS_COUNTS["rows"] += 1
+                    return _gate_up_input_grad_rows(nf4, dh_box, x16, gate_proj, up_proj, bounds)
                 return _gate_up_input_grad_both(nf4, dh_box, x16, gate_proj, up_proj)
             return _gate_up_input_grad_up(nf4, dh_box, x16, gate_proj, up_proj, g_saved)
         REUSE_COUNTS["fallback"] += 1

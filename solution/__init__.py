@@ -60,11 +60,25 @@ K1 / K2 / K3 launch `soup_*_usig` entries whose body is the v7 kernel, inlined. 
 v8 C2, `solution/kernels/swiglu.py` USE_SOUP_SWIGLU (flag below): K4 and S4 run our own
 soup_swiglu_kernel (forward and backward in one jit by a runtime mode, in place in S4) instead of
 the starter kit's two example kernels. Same values.
+v9 M2, `solution/lora_recompute.py` USE_LORA_INPUT_RECOMPUTE (flag below): on U's packed path the
+q/v LoRA-A fp16 inputs are not kept; backward rebuilds them bit for bit from the residual r that
+input_layernorm and B keep anyway (K3 norm replay, zero-fill + index_copy, dropout replay from the
+saved RNG state, fp16 cast). Same values.
+v9 M3, `solution/sdpa_recompute.py` USE_ROW_COMPACT + `solution/unpad.py` _row_scope (flag
+below): A1 keeps q16 / k16 / v16 of the real rows only and scatters them back into zeros in its
+backward recompute. Same gradients (pad query rows have dO = 0, pad keys are masked).
 The example's own class patch (`solution/swiglu.py: patch_qwen2_mlp`) stays off; with
 USE_SOUP_SWIGLU off, K4 and S4 call the example kernels directly (v7).
+v9 M5, USE_BWD_CHUNKING (flag below): the step's peak is the layer-27 MLP backward (S4 / B "both":
+dh, g, u, W_gate, W_up alive). `solution/mlp_recompute.py` _gate_up_input_grad_rows keeps one
+dense weight at a time and recomputes u in BWD_ROW_CHUNKS row chunks (3U + 2W -> 2U + W + U/k),
+and `solution/kernels/head_ce.py` VOCAB_TILE goes 16384 -> K2_VOCAB_TILE so K2's tiles stay under
+the new peak. Forward values unchanged; the S4 input gradient is bit-identical to "both" when
+cuBLAS's u GEMM gives the same rows for M = chunk as for M = N (tests/test_bwd_chunking.py checks
+it on the T4); K2's hidden gradient sums 19 tile partials instead of 10 (equal within K2's tests).
 """
 
-from . import fused_block, head_loss, lora_replay, mlp, mlp_recompute, saved_compact
+from . import fused_block, head_loss, lora_recompute, lora_replay, mlp, mlp_recompute, saved_compact
 from . import sdpa_recompute, unpad
 from .head_loss import patch_head_loss
 from .kernels.nf4 import patch_bnb_matmul_4bit
@@ -83,6 +97,11 @@ USE_SDPA_RECOMPUTE = True  # v6 A1
 # v7 I1: on U's packed path A1 calls SDPA with is_causal=True instead of the causal+padding
 # bool mask (same attention on real rows; pad rows are dropped by U). Needs A1 and U.
 USE_SDPA_CAUSAL_PADDED = True
+# v9 M3: on U's packed path A1 saves q16 / k16 / v16 for the real rows only ([N, heads, 128]) and
+# rebuilds them with zero pad rows in backward; every gradient leaving the layer is unchanged
+# (proof in solution/sdpa_recompute.py). ~-76 MiB at the peak [estimate]. Needs A1 and U; works
+# with and without I1. False = v8b.
+USE_SDPA_ROW_COMPACT = True
 USE_LORA_DROPOUT_REPLAY = True  # v6 A2
 USE_LORA_ROW_COMPACT = True  # v6 D (needs U)
 # v6 A: fallback for A1 only. Taken only when USE_SDPA_RECOMPUTE is False (see the docstring).
@@ -114,6 +133,23 @@ USE_UNIFIED_SIG = True
 # kit's two example kernels (one compile instead of two). Same values. False = v7.
 USE_SOUP_SWIGLU = True
 
+# v9 M5 (solution/mlp_recompute.py, solution/kernels/head_ce.py). Per step at the peak batch
+# (N = 1350 real rows) [estimate]: layer-27 MLP backward transients 121.7 -> 78.9 MiB, K2's forward
+# tiles 90 -> 45 MiB, backward 102 -> 57 MiB; the step's peak drops ~43 MiB (next limit: the
+# layer-27 MLP forward, ~6 MiB below). Cost ~+0.3-0.5 s per run: one more W_gate dequant per
+# chunked MLP backward, the u GEMM in pieces, 9 more K2 tiles. False = v8b exactly.
+USE_BWD_CHUNKING = True
+BWD_ROW_CHUNKS = 4         # u recompute pieces (384-row chunks at N = 1350)
+BWD_CHUNK_MIN_ROWS = 512   # smaller batches keep "both" (not the peak; saves the extra dequant)
+K2_VOCAB_TILE = 8192
+
+# v9 M2 (solution/lora_recompute.py; needs U and K3): on U's packed path the LoRA-A fp16 inputs of
+# q_proj / v_proj are not kept; backward rebuilds them bit for bit from the residual r that
+# input_layernorm and B keep anyway (norm replay, zero-fill + index_copy, dropout replay from the
+# saved RNG state, fp16 cast). -2 x N x 1536 x 2 B per layer: ~221 MiB at N = 1350 over 28 layers
+# [estimate]. Same values. False = v8b.
+USE_LORA_INPUT_RECOMPUTE = True
+
 
 def apply():
     # nf4 and head_ce are imported above (K1 patch, head_loss); addnorm loads here. Importing a
@@ -131,6 +167,10 @@ def apply():
     patch_qwen2_mlp_fp16()         # K4
     mlp_recompute.USE_MLP_RECOMPUTE = USE_MLP_RECOMPUTE
     mlp_recompute.S4_DEQUANT_REUSE = S4_DEQUANT_REUSE  # v7 I2
+    # v9 M5: read at every S4 / B backward and every K2 call; off = v8b's values.
+    mlp_recompute.BWD_ROW_CHUNKS = int(BWD_ROW_CHUNKS) if USE_BWD_CHUNKING else 1
+    mlp_recompute.BWD_CHUNK_MIN_ROWS = int(BWD_CHUNK_MIN_ROWS)
+    _k2.VOCAB_TILE = int(K2_VOCAB_TILE) if USE_BWD_CHUNKING else _k2.VOCAB_TILE_V8
     if USE_MLP_RECOMPUTE:
         mlp_recompute.patch_qwen2_mlp_recompute()  # S4, on top of K4
     if USE_ADDNORM:                # K3
@@ -149,6 +189,7 @@ def apply():
     sdpa_recompute.USE_SDPA_RECOMPUTE = USE_SDPA_RECOMPUTE
     a1 = USE_SDPA_RECOMPUTE and sdpa_recompute.patch_sdpa_recompute()
     sdpa_recompute.USE_CAUSAL_PADDED = bool(USE_SDPA_CAUSAL_PADDED and a1 and USE_UNPAD)  # I1
+    sdpa_recompute.USE_ROW_COMPACT = bool(USE_SDPA_ROW_COMPACT and a1 and USE_UNPAD)  # v9 M3
     if not a1:
         sdpa_recompute.USE_SDPA_RECOMPUTE = False
         if USE_UNPAD and USE_SDPA_KV_COMPACT:  # A runs only inside U's packed-layer scope
@@ -156,6 +197,10 @@ def apply():
     lora_replay.USE_LORA_DROPOUT_REPLAY = USE_LORA_DROPOUT_REPLAY
     if USE_LORA_DROPOUT_REPLAY:    # A2
         lora_replay.patch_lora_dropout_replay()
+    # v9 M2 after A2: its class patch must be the outer one (it hands every other call to A2's).
+    lora_recompute.USE_LORA_INPUT_RECOMPUTE = False
+    if USE_LORA_INPUT_RECOMPUTE and USE_UNPAD and USE_ADDNORM:
+        lora_recompute.USE_LORA_INPUT_RECOMPUTE = lora_recompute.patch_lora_input_recompute()
     if USE_HEAD_CE:                # K2
         head_loss.STORE_HEAD_FP16 = STORE_HEAD_FP16
         patch_head_loss()
