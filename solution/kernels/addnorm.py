@@ -35,6 +35,8 @@ Kernels:
   added and store_r is set, y, rstd.
 - soup_addnorm_bwd_kernel: dx = rstd * (g - x * rstd^2 * mean(g * x)) with g = w * dy, plus the
   incoming residual gradient dr (runtime flag has_dr). No dW: the norm weights are frozen.
+- soup_addnorm_fwd_usig / soup_addnorm_bwd_usig (v8 C1, USE_UNIFIED_SIG): the same two kernels
+  behind the launcher signature all our kernels share (solution/kernels/__init__.py).
 
 Idea credit: fused add + RMSNorm as in Liger-Kernel and Unsloth; code written from scratch from the
 formula above. tl.rsqrt and the needs_input_grad gating follow the reviewed GPT-6-Astra K3 draft.
@@ -47,6 +49,9 @@ import triton.language as tl
 HIDDEN_SIZE = 1536  # Qwen2.5-1.5B hidden size; the only width this file accepts
 BLOCK = 2048  # next power of two >= HIDDEN_SIZE
 NUM_WARPS = 4  # 128 threads x 16 elements per row; 8 is the alternative to time on T4
+# v8 C1: launch the *_usig entries below instead of the two kernels directly. solution.apply()
+# sets it; the module default is the v7 launch.
+USE_UNIFIED_SIG = False
 
 
 @triton.jit(do_not_specialize=["has_delta", "store_r", "eps"])
@@ -103,6 +108,31 @@ def soup_addnorm_bwd_kernel(
     tl.store(DX + offs, dx + dr, mask=cmask)
 
 
+# v8 C1 entries: slots 0-6 pointers, 7-10 int32, 11 fp32, no constexpr parameter
+# (solution/kernels/__init__.py). The bodies are the kernels above, inlined, with the same
+# arguments and constexpr values; the slots the v7 kernels left specialised stay specialised.
+_H = tl.constexpr(HIDDEN_SIZE)
+_BLOCK = tl.constexpr(BLOCK)
+
+
+@triton.jit(do_not_specialize=["spare_p6", "has_delta", "store_r", "spare_i2", "spare_i3", "eps"])
+def soup_addnorm_fwd_usig(
+    X, D, W, Y, R, RSTD, spare_p6,
+    has_delta, store_r, spare_i2, spare_i3,
+    eps,
+):
+    soup_addnorm_fwd_kernel(X, D, W, Y, R, RSTD, has_delta, store_r, eps, _H, _BLOCK)
+
+
+@triton.jit(do_not_specialize=["has_dr", "has_delta", "spare_i2", "spare_i3", "spare_f"])
+def soup_addnorm_bwd_usig(
+    DY, DR, X, D, W, RSTD, DX,
+    has_dr, has_delta, spare_i2, spare_i3,
+    spare_f,
+):
+    soup_addnorm_bwd_kernel(DY, DR, X, D, W, RSTD, DX, has_dr, has_delta, _H, _BLOCK)
+
+
 def _dummy16(x):
     # Never read (its loads are masked off); fp16 so the training paths keep one variant.
     return torch.empty((1,), device=x.device, dtype=torch.float16)
@@ -117,11 +147,19 @@ def _launch_fwd(x, delta, weight, eps, store_r=True):
     rstd = torch.empty((rows,), device=x.device, dtype=torch.float32)
     if rows:
         with torch.cuda.device(x.device):
-            soup_addnorm_fwd_kernel[(rows,)](
-                x, delta if delta is not None else _dummy16(x), weight, y, r, rstd,
-                1 if delta is not None else 0, 1 if keep_r else 0, eps,
-                H=HIDDEN_SIZE, BLOCK=BLOCK, num_warps=NUM_WARPS,
-            )
+            if USE_UNIFIED_SIG:  # C1: y fills the spare pointer slot (never read)
+                soup_addnorm_fwd_usig[(rows,)](
+                    x, delta if delta is not None else _dummy16(x), weight, y, r, rstd, y,
+                    1 if delta is not None else 0, 1 if keep_r else 0, 0, 0,
+                    float(eps),
+                    num_warps=NUM_WARPS,
+                )
+            else:
+                soup_addnorm_fwd_kernel[(rows,)](
+                    x, delta if delta is not None else _dummy16(x), weight, y, r, rstd,
+                    1 if delta is not None else 0, 1 if keep_r else 0, eps,
+                    H=HIDDEN_SIZE, BLOCK=BLOCK, num_warps=NUM_WARPS,
+                )
     return (r if keep_r else None), y, rstd
 
 
@@ -131,12 +169,21 @@ def _launch_bwd(dy, dr, x, weight, rstd, delta=None):
     dx = torch.empty_like(x)
     if rows:
         with torch.cuda.device(x.device):
-            soup_addnorm_bwd_kernel[(rows,)](
-                dy, dr if dr is not None else dy, x,
-                delta if delta is not None else _dummy16(x), weight, rstd, dx,
-                1 if dr is not None else 0, 1 if delta is not None else 0,
-                H=HIDDEN_SIZE, BLOCK=BLOCK, num_warps=NUM_WARPS,
-            )
+            if USE_UNIFIED_SIG:  # C1: seven pointers already; spare ints 0, spare float 0.0
+                soup_addnorm_bwd_usig[(rows,)](
+                    dy, dr if dr is not None else dy, x,
+                    delta if delta is not None else _dummy16(x), weight, rstd, dx,
+                    1 if dr is not None else 0, 1 if delta is not None else 0, 0, 0,
+                    0.0,
+                    num_warps=NUM_WARPS,
+                )
+            else:
+                soup_addnorm_bwd_kernel[(rows,)](
+                    dy, dr if dr is not None else dy, x,
+                    delta if delta is not None else _dummy16(x), weight, rstd, dx,
+                    1 if dr is not None else 0, 1 if delta is not None else 0,
+                    H=HIDDEN_SIZE, BLOCK=BLOCK, num_warps=NUM_WARPS,
+                )
     return dx
 
 

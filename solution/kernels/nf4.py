@@ -85,6 +85,9 @@ USE_K1_FAST_HOST = False
 USE_DENSE_CACHE = False
 DENSE_CACHE_QO = False
 DENSE_CACHE_MIB = 64
+# v8 C1 (solution/kernels/__init__.py): launch soup_nf4_dequant_usig, the same kernel inlined behind
+# the launcher signature all our kernels share. solution.apply() sets it; default = v7 launch.
+USE_UNIFIED_SIG = False
 
 
 @triton.jit(do_not_specialize=["n_groups"])
@@ -171,6 +174,23 @@ def soup_nf4_dequant_kernel(
     hb = h.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
     lb = l.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
     tl.store(Out32 + idx, hb | (lb << 16), mask=ok)
+
+
+# v8 C1 entry: slots 0-6 pointers, 7-10 int32, 11 fp32, no constexpr parameter
+# (solution/kernels/__init__.py). Same pointers (specialised as before), n_groups in
+# do_not_specialize as before, ROWS from the same constant; launched with the same num_warps and
+# enable_fp_fusion=False, which apply to the inlined body.
+_ROWS_C = tl.constexpr(_ROWS)
+
+
+@triton.jit(do_not_specialize=["spare_p6", "n_groups", "spare_i1", "spare_i2", "spare_i3",
+                               "spare_f"])
+def soup_nf4_dequant_usig(
+    Packed, Abs8, Abs2, Code2, Offset, Out32, spare_p6,
+    n_groups, spare_i1, spare_i2, spare_i3,
+    spare_f,
+):
+    soup_nf4_dequant_kernel(Packed, Abs8, Abs2, Code2, Offset, Out32, n_groups, _ROWS_C)
 
 
 def _check_tensor(tensor, name, dtype, device, count, *, vector=False):
@@ -455,6 +475,21 @@ def _launch(packed, quant_state, count, out):
 
 
 def _launch_here(packed, quant_state, n_groups, out32):
+    if USE_UNIFIED_SIG:  # C1: out32 fills the spare pointer slot (never read)
+        soup_nf4_dequant_usig[(triton.cdiv(n_groups, _ROWS),)](
+            packed,
+            quant_state.absmax,
+            quant_state.state2.absmax,
+            quant_state.state2.code,
+            quant_state.offset,
+            out32,
+            out32,
+            n_groups, 0, 0, 0,
+            0.0,
+            num_warps=_NUM_WARPS,
+            enable_fp_fusion=False,
+        )
+        return
     # Same arguments, constexprs and options as v6.1: no new Triton specialization.
     soup_nf4_dequant_kernel[(triton.cdiv(n_groups, _ROWS),)](
         packed,

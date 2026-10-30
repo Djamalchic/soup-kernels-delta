@@ -8,18 +8,41 @@ values, and SiLU(gate) * up runs in fp32 only to be cast to fp16 again by down_p
 
 Feeding the MLP an fp16 input produces the same fp16 matmul results, but autograd now keeps gate
 and up in fp16 instead of three fp32 tensors (gate, SiLU(gate), up) of shape [tokens, 8960]:
-about 140 MiB less per layer at 2048 tokens. SiLU(gate) * up runs in the starter kit's example
-SwiGLU kernel (fp32 math inside, fp16 in and out), which rounds to fp16 exactly where down_proj
-rounded before. The example kernel does not count as our own kernel; this patch is about memory.
+about 140 MiB less per layer at 2048 tokens. SiLU(gate) * up runs in a SwiGLU kernel (fp32 math
+inside, fp16 in and out), which rounds to fp16 exactly where down_proj rounded before: our
+soup_swiglu_kernel with v8 C2 on (below), the starter kit's example kernel with it off (v7).
 
 The patch is guarded: any module or input that is not the expected shape (real bitsandbytes
 Linear4bit layers with an fp16 compute dtype, a CUDA input, SiLU activation) runs the original
 forward unchanged.
+
+v8 C2 (USE_SOUP_SWIGLU, set by solution.apply()): the SwiGLU in between is our own
+soup_swiglu_kernel (solution/kernels/swiglu.py, same values) instead of the example's two kernels.
+S4 (solution/mlp_recompute.py) reads the same switch through soup_swiglu_module().
 """
 
 import torch
 
 _PATCH_MARK = "_soup_delta_fp16_mlp"
+
+# v8 C2. Module default False = the starter kit's example kernels (v7).
+USE_SOUP_SWIGLU = False
+_soup_swiglu = None  # solution.kernels.swiglu, loaded by the patch (no CUDA work at import)
+
+
+def _load_soup_swiglu():
+    global _soup_swiglu
+    if _soup_swiglu is None:
+        from .kernels import swiglu as soup
+
+        _soup_swiglu = soup
+    return _soup_swiglu
+
+
+def soup_swiglu_module():
+    """Our SwiGLU module while USE_SOUP_SWIGLU is on and a patch has loaded it, else None (then
+    the example's kernels run, as in v7)."""
+    return _soup_swiglu if USE_SOUP_SWIGLU else None
 
 
 def _fp16_path_ok(module, x):
@@ -49,6 +72,7 @@ def patch_qwen2_mlp_fp16():
 
     from .swiglu import swiglu
 
+    _load_soup_swiglu()  # C2; before the idempotency check, so S4's call loads it too
     current = modeling_qwen2.Qwen2MLP.forward
     if getattr(current, _PATCH_MARK, False):
         return
@@ -58,7 +82,9 @@ def patch_qwen2_mlp_fp16():
         if not _fp16_path_ok(self, x):
             return original(self, x)
         x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
-        hidden = swiglu(self.gate_proj(x16), self.up_proj(x16))
+        soup = soup_swiglu_module()
+        act = soup.swiglu if soup is not None else swiglu
+        hidden = act(self.gate_proj(x16), self.up_proj(x16))
         out = self.down_proj(hidden)
         return out if out.dtype == x.dtype else out.to(x.dtype)
 

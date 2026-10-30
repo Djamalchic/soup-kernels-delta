@@ -49,17 +49,36 @@ def recorder(monkeypatch):
                       (sdpa_recompute, "USE_CAUSAL_PADDED"),
                       (lora_replay, "USE_LORA_DROPOUT_REPLAY"), (head_loss, "STORE_HEAD_FP16")):
         monkeypatch.setattr(mod, flag, getattr(mod, flag))
-    from solution.kernels import nf4  # v7 I3: apply() writes these too
+    from solution import mlp
+    from solution.kernels import addnorm, head_ce, nf4  # v7 I3 / v8 C1: apply() writes these too
 
     for flag in ("USE_K1_FAST_HOST", "USE_DENSE_CACHE", "DENSE_CACHE_QO", "DENSE_CACHE_MIB"):
         monkeypatch.setattr(nf4, flag, getattr(nf4, flag))
+    for mod in (nf4, addnorm, head_ce):  # v8 C1
+        monkeypatch.setattr(mod, "USE_UNIFIED_SIG", getattr(mod, "USE_UNIFIED_SIG"))
+    monkeypatch.setattr(mlp, "USE_SOUP_SWIGLU", mlp.USE_SOUP_SWIGLU)  # v8 C2
     for flag in ("USE_ADDNORM", "USE_UNPAD", "USE_MLP_RECOMPUTE", "USE_HEAD_CE", "USE_FUSED_BLOCK",
                  "USE_SDPA_RECOMPUTE", "USE_SDPA_CAUSAL_PADDED", "USE_LORA_DROPOUT_REPLAY",
                  "USE_LORA_ROW_COMPACT", "USE_SDPA_KV_COMPACT", "STORE_HEAD_FP16", "S4_DEQUANT_REUSE",
                  "S4_OFF_FRACTION", "USE_K1_FAST_HOST", "USE_DENSE_CACHE", "DENSE_CACHE_QO",
-                 "DENSE_CACHE_MIB"):
+                 "DENSE_CACHE_MIB", "USE_UNIFIED_SIG", "USE_SOUP_SWIGLU"):
         monkeypatch.setattr(solution, flag, getattr(solution, flag))
     return calls, result
+
+
+@pytest.mark.parametrize("unified, soup", [(True, True), (False, False), (True, False)])
+def test_v8_flags_reach_the_modules(recorder, monkeypatch, unified, soup):
+    """C1 / C2: apply() copies USE_UNIFIED_SIG into K1 / K2 / K3 and USE_SOUP_SWIGLU into K4
+    (which S4 reads); the module defaults are the v7 launches."""
+    from solution import mlp
+    from solution.kernels import addnorm, head_ce, nf4
+
+    assert solution.USE_UNIFIED_SIG is True and solution.USE_SOUP_SWIGLU is True
+    monkeypatch.setattr(solution, "USE_UNIFIED_SIG", unified)
+    monkeypatch.setattr(solution, "USE_SOUP_SWIGLU", soup)
+    solution.apply()
+    assert nf4.USE_UNIFIED_SIG is addnorm.USE_UNIFIED_SIG is head_ce.USE_UNIFIED_SIG is unified
+    assert mlp.USE_SOUP_SWIGLU is soup
 
 
 def test_defaults_are_the_v6_merge():

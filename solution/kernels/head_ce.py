@@ -39,6 +39,10 @@ loads (16384, 4480 and both times 1536 are all multiples of 16, so training sees
 W32 argument of modes 0 and 1 is a placeholder (never read there): it is always an fp32 tensor, so
 an fp16 head does not change the signature either.
 
+v8 C1 (USE_UNIFIED_SIG, solution/kernels/__init__.py): `_launch` calls `soup_head_ce_usig`, the
+same kernel inlined behind the launcher signature all our kernels share; n_cols stays specialised
+there, row0 / col0 / mode stay in do_not_specialize, so the compiled body is the v7 one.
+
 Ideas credited (no code taken): online softmax (Milakov & Gimelshein, 2018); chunked fused linear +
 cross-entropy with logits recomputed in backward (Liger-Kernel `fused_linear_cross_entropy`; Apple,
 "Cut Your Losses in Large-Vocabulary Language Models"); the logits-free step contract (Soup #1693,
@@ -69,6 +73,10 @@ NUM_WARPS = 8
 _NCOL = 8
 _M, _S, _ENT, _LOSS, _HIT = 0, 1, 5, 6, 7
 _STATS, _GRAD, _CAST = 0, 1, 2
+
+# v8 C1: launch soup_head_ce_usig instead of soup_head_ce_kernel. solution.apply() sets it; the
+# module default is the v7 launch.
+USE_UNIFIED_SIG = False
 
 
 @triton.jit(do_not_specialize=["row0", "col0", "mode"])
@@ -157,7 +165,31 @@ def soup_head_ce_kernel(
                 tl.store(lrow + g_cols, grad.to(tl.float16), mask=g_valid)
 
 
+# v8 C1 entry: slots 0-6 pointers, 7-10 int32, 11 fp32, no constexpr parameter
+# (solution/kernels/__init__.py). n_cols (slot 8) is specialised exactly as in the kernel above.
+_BLOCK_V_C = tl.constexpr(BLOCK_V)
+_NCOL_C = tl.constexpr(_NCOL)
+
+
+@triton.jit(do_not_specialize=["spare_p5", "spare_p6", "row0", "col0", "mode", "spare_f"])
+def soup_head_ce_usig(
+    Out16, Target, State, Scale, W32, spare_p5, spare_p6,
+    row0, n_cols, col0, mode,
+    spare_f,
+):
+    soup_head_ce_kernel(Out16, Target, State, Scale, W32, row0, n_cols, col0, mode,
+                        _BLOCK_V_C, _NCOL_C)
+
+
 def _launch(grid, out16, target, state, scale, w32, row0, n_cols, col0, mode):
+    if USE_UNIFIED_SIG:  # C1: `state` (fp32, always passed) fills the two spare pointer slots
+        soup_head_ce_usig[grid](
+            out16, target, state, scale, w32, state, state,
+            row0, n_cols, col0, mode,
+            0.0,
+            num_warps=NUM_WARPS,
+        )
+        return
     soup_head_ce_kernel[grid](
         out16, target, state, scale, w32, row0, n_cols, col0, mode,
         BLOCK_V=BLOCK_V, NCOL=_NCOL, num_warps=NUM_WARPS,

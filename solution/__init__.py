@@ -7,10 +7,11 @@ touch CUDA, compile kernels or change any setting.
 - K1, `solution/kernels/nf4.py`: our NF4 dequantization kernel replaces bitsandbytes' dequant on
   its dequant+linear path, in the forward pass and in the backward re-dequant (bit-exact).
 - K4, `solution/mlp.py`: the Qwen2 MLP runs on fp16 activations (bitsandbytes computes in fp16
-  anyway), with the starter kit's example SwiGLU kernel in between. S4,
-  `solution/mlp_recompute.py` (flag below): the MLP saves only its fp16 input and recomputes gate
-  and up in backward; the example's SwiGLU backward kernel then writes its two gradients over its
-  own fresh inputs (same kernel, same bits, two fewer [tokens, 8960] buffers at that moment).
+  anyway), with a SwiGLU kernel in between (ours since v8 C2, the starter kit's example with
+  USE_SOUP_SWIGLU off). S4, `solution/mlp_recompute.py` (flag below): the MLP saves only its fp16
+  input and recomputes gate and up in backward; the SwiGLU backward kernel then writes its two
+  gradients over its own fresh inputs (same kernel, same bits, two fewer [tokens, 8960] buffers at
+  that moment).
 - K3, `solution/kernels/addnorm.py` + `solution/layers.py`: Qwen2RMSNorm and the first residual
   add fused with post_attention_layernorm in our two kernels on the fp32 residual stream (the
   attention output is read as fp16 and widened inside the kernel).
@@ -43,19 +44,27 @@ A1's SDPA backward, which is only as deterministic as torch's):
 - K2 part 3, `solution/head_loss.py` STORE_HEAD_FP16 (off): lossless fp16 storage of the frozen
   tied embedding / lm_head after an element-by-element check on the device.
 
-v7 I4, `solution/unpad.py` S4_OFF_FRACTION (flag below): the first quarter of the packed layers
-skip B and S4 (K3 add_rmsnorm + K4 MLP keep gate/up), trading ~38 KiB per real token per layer of
-the memory headroom for the gate/up recompute in backward. Bit-identical values.
+v7 I4, `solution/unpad.py` S4_OFF_FRACTION (flag below): the first int(layers * fraction) packed
+layers skip B and S4 (K3 add_rmsnorm + K4 MLP keep gate/up), trading ~38 KiB per real token per
+layer of the memory headroom for the gate/up recompute in backward. Bit-identical values. v8 sets
+the fraction to 0.0 (every packed layer keeps S4, as v6.1); the path stays for tuning.
 v7 I2, `solution/mlp_recompute.py` S4_DEQUANT_REUSE: S4's backward dequantizes W_gate / W_up once
 each and reuses them for the recompute and dx (was twice). Bit-identical values.
 v7 I3, `solution/kernels/nf4.py` USE_K1_FAST_HOST / USE_DENSE_CACHE: K1's validation cache accepts
 aliases of the validated weight, the launch skips a same-device context, and k_proj / v_proj keep
 their fp16 dequant for the run (42 MiB). Same values.
-The example's own class patch (`solution/swiglu.py: patch_qwen2_mlp`) stays off: K4 calls the
-example kernel directly.
+v8 C1, `solution/kernels/__init__.py` USE_UNIFIED_SIG (flag below): every kernel we launch takes
+the same twelve runtime arguments (7 pointers, 4 int32, 1 fp32, no constexpr parameter; modes and
+offsets in do_not_specialize), so Triton gcc-builds one launcher per run instead of one per kernel.
+K1 / K2 / K3 launch `soup_*_usig` entries whose body is the v7 kernel, inlined. Same values.
+v8 C2, `solution/kernels/swiglu.py` USE_SOUP_SWIGLU (flag below): K4 and S4 run our own
+soup_swiglu_kernel (forward and backward in one jit by a runtime mode, in place in S4) instead of
+the starter kit's two example kernels. Same values.
+The example's own class patch (`solution/swiglu.py: patch_qwen2_mlp`) stays off; with
+USE_SOUP_SWIGLU off, K4 and S4 call the example kernels directly (v7).
 """
 
-from . import fused_block, head_loss, lora_replay, mlp_recompute, saved_compact
+from . import fused_block, head_loss, lora_replay, mlp, mlp_recompute, saved_compact
 from . import sdpa_recompute, unpad
 from .head_loss import patch_head_loss
 from .kernels.nf4 import patch_bnb_matmul_4bit
@@ -84,7 +93,9 @@ STORE_HEAD_FP16 = False
 # S4's recompute (28 layers -> 7; 2-3-layer test models -> 0). Same values, ~+343 MiB at the peak
 # batch [estimate], less backward work. Kaggle tuning: peak > 3 280 MiB -> 0.215 (6 layers),
 # peak < 3 150 MiB -> 0.29 (8 layers). 0.0 is exactly v6.1.
-S4_OFF_FRACTION = 0.25
+# v8 F1: 0.0. The Kaggle scouting run measured the same speed at 0.0 as at v7's 0.25 and a
+# 2 893 MiB peak instead of 3 233 (ADR-002 cap: <= 3 000 MiB).
+S4_OFF_FRACTION = 0.0
 
 # v7 I3 (solution/kernels/nf4.py). FAST_HOST: K1's validation cache also hits for D's / S4's
 # aliases of a validated weight, and the launch skips a same-device torch.cuda.device context.
@@ -95,14 +106,27 @@ USE_DENSE_CACHE = True
 DENSE_CACHE_QO = False
 DENSE_CACHE_MIB = 64
 
+# v8 C1 (solution/kernels/__init__.py): K1 / K2 / K3 launch their *_usig entries, which share one
+# runtime signature with C2's kernel: one gcc-built Triton launcher per run instead of six (step 1).
+# Same compiled bodies, same values. False = the v7 launches.
+USE_UNIFIED_SIG = True
+# v8 C2 (solution/kernels/swiglu.py): K4 and S4 run our soup_swiglu_kernel instead of the starter
+# kit's two example kernels (one compile instead of two). Same values. False = v7.
+USE_SOUP_SWIGLU = True
+
 
 def apply():
-    from .kernels import nf4 as _nf4  # already imported above (patch_bnb_matmul_4bit)
+    # nf4 and head_ce are imported above (K1 patch, head_loss); addnorm loads here. Importing a
+    # kernel module only defines Triton functions: no CUDA work, no compile.
+    from .kernels import addnorm as _k3, head_ce as _k2, nf4 as _nf4
 
     _nf4.USE_K1_FAST_HOST = USE_K1_FAST_HOST  # I3
     _nf4.USE_DENSE_CACHE = USE_DENSE_CACHE
     _nf4.DENSE_CACHE_QO = DENSE_CACHE_QO
     _nf4.DENSE_CACHE_MIB = DENSE_CACHE_MIB
+    for _kernels in (_nf4, _k3, _k2):  # C1, read at every launch
+        _kernels.USE_UNIFIED_SIG = bool(USE_UNIFIED_SIG)
+    mlp.USE_SOUP_SWIGLU = bool(USE_SOUP_SWIGLU)  # C2, read by K4 and S4 at every call
     patch_bnb_matmul_4bit()        # K1
     patch_qwen2_mlp_fp16()         # K4
     mlp_recompute.USE_MLP_RECOMPUTE = USE_MLP_RECOMPUTE

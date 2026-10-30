@@ -270,10 +270,16 @@ def test_s4_off_count(monkeypatch):
 def test_apply_forwards_s4_off_fraction(recorder, monkeypatch):  # noqa: F811
     monkeypatch.setattr(unpad, "S4_OFF_FRACTION", unpad.S4_OFF_FRACTION)
     monkeypatch.setattr(solution, "S4_OFF_FRACTION", solution.S4_OFF_FRACTION)
-    assert solution.S4_OFF_FRACTION == 0.25
+    # v8 F1: the default is 0.0 (S4 on every packed layer, as v6.1); the I4 path stays and is
+    # driven by explicit fractions here and in the tests around this one.
+    assert solution.S4_OFF_FRACTION == 0.0
     solution.apply()
-    assert unpad.S4_OFF_FRACTION == 0.25
-    monkeypatch.setattr(solution, "USE_UNPAD", False)
+    assert unpad.S4_OFF_FRACTION == 0.0
+    for frac in (0.25, 0.072):  # v7's value; ADR-002's 2-of-28-layers setting
+        monkeypatch.setattr(solution, "S4_OFF_FRACTION", frac)
+        solution.apply()
+        assert unpad.S4_OFF_FRACTION == frac
+    monkeypatch.setattr(solution, "USE_UNPAD", False)  # I4 lives in U's packed path
     solution.apply()
     assert unpad.S4_OFF_FRACTION == 0.0
 
@@ -285,9 +291,28 @@ def _grad_scaler():
     return torch.cuda.amp.GradScaler()
 
 
+def _requested_bytes():
+    """Bytes the live tensors asked the CUDA caching allocator for; None if this torch has no
+    such statistic.
+
+    memory_allocated() counts whole blocks: a large-pool request (> 1 MiB) served from a cached
+    free block is not split when the remainder is <= 1 MiB, so a tensor may count up to 1 MiB
+    more than its size, depending on what earlier runs left in the cache. "requested_bytes"
+    counts the requested sizes only. [From memory, torch source is not on disk: c10/cuda/
+    CUDACachingAllocator.cpp should_split (kSmallSize = 1 MiB) and the allocated_bytes /
+    requested_bytes stats; torch.cuda.memory_stats documents requested_bytes.*.current.]"""
+    try:
+        value = torch.cuda.memory_stats().get("requested_bytes.all.current")
+    except Exception:  # noqa: BLE001 - an older torch: the caller falls back to memory_allocated
+        return None
+    return None if value is None else int(value)
+
+
 def _run_step(pm, batch, forward, extra, seed=1234):
     """One training step as accelerate runs it in fp16: autocast forward, GradScaler-scaled
-    backward, AdamW step through the scaler. Restores the LoRA weights afterwards."""
+    backward, AdamW step through the scaler. Restores the LoRA weights afterwards. "held" is
+    memory_allocated() after the forward minus before it; "held_req" the same in requested
+    bytes (None without that statistic)."""
     mq.Qwen2Model.forward = forward
     named = [(n, p) for n, p in pm.named_parameters() if p.requires_grad]
     init = [p.detach().clone() for _, p in named]
@@ -305,10 +330,13 @@ def _run_step(pm, batch, forward, extra, seed=1234):
         torch.manual_seed(seed)
         torch.cuda.synchronize()
         start = torch.cuda.memory_allocated()
+        start_req = _requested_bytes()
         with torch.autocast("cuda", dtype=torch.float16):
             out = pm(**batch, use_cache=False, **extra)
         torch.cuda.synchronize()
         held = torch.cuda.memory_allocated() - start
+        end_req = _requested_bytes()
+        held_req = None if start_req is None or end_req is None else end_req - start_req
         rng_fwd = torch.cuda.get_rng_state()
         scaler.scale(out.loss).backward()
         rng_bwd = torch.cuda.get_rng_state()
@@ -325,17 +353,19 @@ def _run_step(pm, batch, forward, extra, seed=1234):
     pm.zero_grad(set_to_none=True)
     res = {"loss": out.loss.detach().float(), "logits": out.logits.detach().clone(),
            "hidden": rec["hidden"], "rng_fwd": rng_fwd, "rng_bwd": rng_bwd, "grads": grads,
-           "stepped": stepped, "scale": float(scaler.get_scale()), "held": held}
+           "stepped": stepped, "scale": float(scaler.get_scale()), "held": held,
+           "held_req": held_req}
     del out, opt
     return res
 
 
 def test_s4_off_first_layers_bit_exact_and_holds_gate_up(v6_patches, monkeypatch):
     """S4_OFF_FRACTION 0.34 (layer 0 off) and 0.67 (layers 0-1 off) against 0.0 (v6.1) on the
-    real-width 3-layer stack with every v6 piece on: the same loss, logits, hidden states, RNG,
-    LoRA grads and GradScaler step bit for bit; B fires on the other layers only, the off ones are
-    the first ones; autograd holds 32 KiB more per real token for layer 0 and 38 KiB for each later
-    off layer (10 % tolerance)."""
+    real-width 3-layer stack with every v6 piece on: the same loss, logits, hidden states, RNG
+    and GradScaler scale bit for bit, LoRA grads and the AdamW step bit for bit or within
+    tp.GRAD_RTOL; B fires on the other layers only, the off ones are the first ones; autograd
+    holds 32 KiB more per real token for layer 0 and 38 KiB for each later off layer (10 %, on
+    requested bytes)."""
     patched = v6_patches
     fused_calls, off_mlps = [], []
     real_fused, real_off = fb.add_norm_mlp, unpad._mlp_no_recompute
@@ -379,18 +409,42 @@ def test_s4_off_first_layers_bit_exact_and_holds_gate_up(v6_patches, monkeypatch
         assert torch.equal(new["rng_bwd"], ref_a["rng_bwd"])
         for key in ("loss", "logits", "hidden"):
             assert tp._same(new[key], ref_a[key]), (frac, key)
-        # Backward: bit for bit whenever v6.1 reproduces itself (A1's SDPA backward is only as
-        # deterministic as torch's), else within v6.1's own spread.
+        # Backward: bit for bit or within tp.GRAD_RTOL (A1's SDPA backward is only as
+        # deterministic as torch's; a two-run "reproducible" reference proves nothing).
         assert new["grads"].keys() == ref_a["grads"].keys()
         for name in ref_a["grads"]:
-            tp._assert_matches(ref_a["grads"][name], ref_b["grads"][name], new["grads"][name], name)
-            tp._assert_matches(ref_a["stepped"][name], ref_b["stepped"][name],
-                               new["stepped"][name], name)
+            exact = tp._assert_grad_close(ref_a["grads"][name], ref_b["grads"][name],
+                                          new["grads"][name], name)
+            if exact:
+                # The same scaled grad, initial weight and scale: GradScaler's unscale and
+                # AdamW's elementwise update give the same bits.
+                assert tp._same(new["stepped"][name], ref_a["stepped"][name]), name
+            else:
+                tp._assert_grad_close(ref_a["stepped"][name], ref_b["stepped"][name],
+                                      new["stepped"][name], name)
         assert new["scale"] == ref_a["scale"]
 
+        # Held bytes. The prediction is the whole I4 code path: _mlp_no_recompute (unpad.py)
+        # calls K4's forward (mlp.py:60-63), which keeps fp16 gate and up through the example
+        # SwiGLU's save_for_backward (swiglu.py:50) and nothing else (bnb's MatMul4Bit keeps only
+        # the packed weight, bitsandbytes/autograd/_functions.py:357-360, reached at :491; K4's
+        # casts are ToCopy nodes); K3's add_rmsnorm keeps r_mid and rstd (kernels/addnorm.py:167)
+        # where B kept r, a and rstd (fused_block.py:80). The T4 run of 30.10 measured
+        # 10 006 528 B against 8 126 464 at 0.34: the 1 880 064 B gap is not a multiple of the
+        # N = 248 real rows (nor of B*T = 600), so no per-token tensor of the model; it is the
+        # caching allocator's unsplit block remainder (see _requested_bytes), which differs
+        # between runs that allocate in a different order. Requested bytes have no such slack:
+        # the prediction is checked on them, 10 % as before.
         grown = new["held"] - ref_a["held"]
         expect = per_token * n
-        assert abs(grown - expect) <= 0.1 * expect, (frac, grown, expect)
+        if new["held_req"] is not None and ref_a["held_req"] is not None:
+            grown_req = new["held_req"] - ref_a["held_req"]
+            assert abs(grown_req - expect) <= 0.1 * expect, (frac, grown_req, expect, grown)
+        else:
+            # Without requested_bytes: one-sided on memory_allocated. Allocator slack (< 1 MiB
+            # per large block, in either run) may move it either way; at least 80 % of the
+            # memory I4 spends must show.
+            assert grown >= 0.8 * expect, (frac, grown, expect)
 
 
 def test_s4_off_guard_falls_back_to_the_module_call(v6_patches, monkeypatch):

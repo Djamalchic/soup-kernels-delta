@@ -12,7 +12,8 @@ Nothing else in the MLP saves activations: bitsandbytes' MatMul4Bit keeps only t
   1. dh   = grad_out @ dequant(W_down)                 (MatMul4Bit.backward, `_functions.py:384`;
                                                         K1's backward, `nf4.py:233-236`)
   2. g, u = gate_proj(x16), up_proj(x16)              (the same Linear4bit calls as the forward)
-  3. dg, du = the example's SwiGLU backward(dh, g, u)  (`swiglu.py:53-61`, called, not copied)
+  3. dg, du = K4's SwiGLU backward(dh, g, u)           (v8 C2: `kernels/swiglu.py`; flag off: the
+                                                        example's, `swiglu.py:53-61`, called)
   4. dx16 = dg @ dequant(W_gate) + du @ dequant(W_up)  (summed in fp16, as autograd sums the two
                                                         gradients that flow into x16)
 
@@ -32,6 +33,11 @@ goes to K4 (which itself falls back to the original Qwen2MLP.forward). A guard t
 training call while the flag is on prints one RuntimeWarning, so a silently dead S4 shows in the
 run log. Importing this module does no CUDA work and imports neither Triton nor bitsandbytes.
 
+v8 C2: while K4's switch USE_SOUP_SWIGLU is on (`mlp.soup_swiglu_module()`), step 3 and the
+forward's SwiGLU run our soup_swiglu_kernel (solution/kernels/swiglu.py: forward, backward and the
+same in-place backward) instead of the example's kernels. Same values; the example code below stays
+as the flag-off path.
+
 Idea credit: activation recomputation, Chen et al. 2016, "Training Deep Nets with Sublinear Memory
 Cost" (arXiv:1604.06174). The code is our own. No Triton kernel lives in this file.
 """
@@ -49,7 +55,8 @@ USE_MLP_RECOMPUTE = False
 # True: recompute gate and up (saves 64 MiB per layer at 2048 tokens).
 # False: keep the fp16 gate output, recompute only up (saves 29 MiB per layer, half the extra GEMMs).
 RECOMPUTE_GATE = True
-# "example": the starter kit's SwiGLU backward (bit-exact with K4); "torch": plain torch fp32 math.
+# "example": the SwiGLU backward kernel K4 uses (bit-exact with K4): ours with v8 C2's
+# USE_SOUP_SWIGLU on, else the starter kit's. "torch": plain torch fp32 math.
 SWIGLU_BACKWARD = "example"
 # v6: launch the example's SwiGLU backward kernel with its outputs written over its own inputs
 # (dgate over grad, dup over gate) when gate was recomputed here. Same kernel, same arguments
@@ -116,7 +123,21 @@ def _swiglu_backward_torch(dh, gate, up):
     return d.to(out_dtype), du_out
 
 
+def _swiglu_fwd(g, u):
+    """silu(g) * u through K4's SwiGLU: ours (v8 C2) or the example's (v7)."""
+    soup = _k4.soup_swiglu_module()
+    if soup is not None:
+        return soup.swiglu(g, u)
+    return _swiglu_forward(g, u)
+
+
 def _swiglu_backward(dh, gate, up):
+    if SWIGLU_BACKWARD == "example":
+        soup = _k4.soup_swiglu_module()
+        if soup is not None:
+            # v8 C2: the operands the example's forward would have saved (no-ops for our
+            # contiguous fp16 g and u), then our kernel's backward into fresh buffers.
+            return soup.swiglu_backward(dh, gate.contiguous(), up.to(gate.dtype).contiguous())
     if SWIGLU_BACKWARD == "example" and _swiglu_example_backward is not None:
         try:
             # The example's forward saves gate.contiguous() and up.to(gate.dtype).contiguous()
@@ -130,7 +151,9 @@ def _swiglu_backward(dh, gate, up):
 
 
 def _inplace_ok(dh, gate, up):
-    if not INPLACE_SWIGLU_BACKWARD or SWIGLU_BACKWARD != "example" or _swiglu_example_kernel is None:
+    if not INPLACE_SWIGLU_BACKWARD or SWIGLU_BACKWARD != "example":
+        return False
+    if _k4.soup_swiglu_module() is None and _swiglu_example_kernel is None:
         return False
     return (dh.dtype == gate.dtype == up.dtype == torch.float16
             and dh.shape == gate.shape == up.shape
@@ -151,7 +174,13 @@ def _swiglu_backward_inplace(dh, gate, up):
     wrapper's own (`swiglu.py:57-60`: grid cdiv(n, BLOCK), the same BLOCK, fp16 pointers, the
     same n), so Triton reuses its compiled variant. The caller passes fresh dh and gate buffers
     that nothing else references.
+
+    v8 C2: with USE_SOUP_SWIGLU on, our kernel's backward does the same in place
+    (kernels/swiglu.py swiglu_backward_into: same argument, same outputs, same buffers).
     """
+    soup = _k4.soup_swiglu_module()
+    if soup is not None:
+        return soup.swiglu_backward_into(dh, gate, up)
     kernel, block = _swiglu_example_kernel
     n = gate.numel()
     kernel[((n + block - 1) // block,)](dh, gate, up, dh, gate, n, BLOCK=block)
@@ -297,7 +326,7 @@ def mlp_forward_nograd(x16, gate_proj, up_proj, down_proj):
     """down_proj(silu(gate_proj(x16)) * up_proj(x16)) with nothing kept; call with grad off."""
     g = gate_proj(x16)
     u = up_proj(x16)
-    h = _swiglu_forward(g, u)
+    h = _swiglu_fwd(g, u)
     del g, u
     out = down_proj(h)
     del h
@@ -361,7 +390,7 @@ class SoupMLPRecompute(torch.autograd.Function):
         # Grad mode is off in here, so g, u and h are plain tensors that die with this frame.
         g = gate_proj(x16)
         u = up_proj(x16)
-        h = _swiglu_forward(g, u)
+        h = _swiglu_fwd(g, u)
         del u
         if recompute_gate:
             ctx.save_for_backward(x16)

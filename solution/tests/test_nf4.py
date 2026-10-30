@@ -430,8 +430,11 @@ def test_single_soup_kernel_far_from_example(monkeypatch):
     try:
         spec.loader.exec_module(rules)
         _, kernels = rules.triton_kernels(nf4.__file__)
-        assert [node.name for node in kernels] == ["soup_nf4_dequant_kernel"]
-        assert rules.example_likeness(kernels[0]) < rules.EXAMPLE_REVIEW
+        # v8 C1 adds the unified-signature entry, whose body is the kernel above it.
+        assert [node.name for node in kernels] == ["soup_nf4_dequant_kernel",
+                                                   "soup_nf4_dequant_usig"]
+        for node in kernels:
+            assert rules.example_likeness(node) < rules.EXAMPLE_REVIEW
     finally:
         if not had_common:
             sys.modules.pop("common", None)

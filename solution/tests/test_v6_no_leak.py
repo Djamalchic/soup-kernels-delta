@@ -306,10 +306,41 @@ def test_i3_no_revalidation_and_kv_cache_in_training(v6_patches, monkeypatch):
         nf4.dense_cache_clear()
 
 
+def _cached_kv_match_fresh_dequant(pm):
+    """Every cached k/v weight against a fresh K1 dequant of the same Params4bit, bit for bit.
+
+    The cache key is id(quant_state) of the weight Linear4bit.forward hands to bnb.matmul_4bit
+    (bitsandbytes/nn/modules.py:611, :637; kernels/nf4.py:503). v_proj is peft's LoRA wrapper;
+    its bnb layer is get_base_layer() (peft tuners/tuners_utils.py:1438, lora/layer.py:125).
+    The fresh call runs with the cache off, on the Params4bit that owns the _VALID record (the
+    forward validated it), so it neither reads nor changes the cache. Returns the count."""
+    keep = nf4.USE_DENSE_CACHE
+    nf4.USE_DENSE_CACHE = False
+    try:
+        count = 0
+        for layer in tu.inner_model(pm).layers:
+            att = layer.self_attn
+            for proj in (att.k_proj, att.v_proj.get_base_layer()):
+                weight = proj.weight
+                item = nf4._DENSE.get(id(weight.quant_state))
+                assert item is not None and item[0]() is weight.quant_state
+                cached = item[2]
+                fresh = nf4.nf4_dequantize(weight, weight.quant_state)
+                assert fresh is not cached
+                assert tp._same(cached, fresh), tuple(cached.shape)
+                count += 1
+    finally:
+        nf4.USE_DENSE_CACHE = keep
+    return count
+
+
 def test_i3_kv_cache_same_numbers(v6_patches, monkeypatch):
-    """(c) cache off vs on (miss step, then hit step): the same loss, hidden states, RNG stream and
-    LoRA gradients; bit for bit where the cache-off run is itself reproducible (A1's SDPA backward
-    may not be, test_v6_merged)."""
+    """(c) cache off vs on (miss step, then hit step). The cached k/v weights are bit for bit the
+    on-the-fly dequant (after both steps, so no reader wrote into them); with them the forward
+    (loss, hidden states, RNG stream) is bit for bit the cache-off one, and the LoRA gradients
+    are bit for bit or within tp.GRAD_RTOL: the same W gives the same GEMMs, but the cache-off
+    backward is itself not reproducible (A1's SDPA backward, see tp.GRAD_RTOL; the T4 run of
+    30.10 saw ref_a == ref_b and a visible element of layer 0's q lora_A off in the cached run)."""
     patched = v6_patches
     tm._set(True)
     pm = _build_fp16_nf4()
@@ -324,6 +355,7 @@ def test_i3_kv_cache_same_numbers(v6_patches, monkeypatch):
         miss = tm._run(pm, batch, patched, extra)
         assert len(nf4._DENSE) == 2 * pm.config.num_hidden_layers
         hit = tm._run(pm, batch, patched, extra)
+        assert _cached_kv_match_fresh_dequant(pm) == 2 * pm.config.num_hidden_layers
         for new in (miss, hit):
             assert torch.equal(new["rng_fwd"], ref_a["rng_fwd"])
             assert torch.equal(new["rng_bwd"], ref_a["rng_bwd"])
@@ -331,7 +363,7 @@ def test_i3_kv_cache_same_numbers(v6_patches, monkeypatch):
             tp._assert_matches(ref_a["hidden"], ref_b["hidden"], new["hidden"], "hidden")
             assert new["grads"].keys() == ref_a["grads"].keys()
             for name in ref_a["grads"]:
-                tp._assert_matches(ref_a["grads"][name], ref_b["grads"][name], new["grads"][name],
-                                   name)
+                tp._assert_grad_close(ref_a["grads"][name], ref_b["grads"][name],
+                                      new["grads"][name], name)
     finally:
         nf4.dense_cache_clear()

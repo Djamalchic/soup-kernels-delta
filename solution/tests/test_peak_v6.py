@@ -54,6 +54,35 @@ def _assert_matches(ref_a, ref_b, new, name=""):
         assert tu.rel(new, ref_a) <= 4 * noise + 1e-7, name
 
 
+# LoRA gradients of a whole-model training step. The backward of these stacks is not reproducible
+# run to run, so _assert_matches' "ref_a == ref_b, hence bit for bit" is a two-sample guess that
+# fails at random. Kaggle T4 evidence (30.10): two identical v5 runs of test_v6_merged's stack came
+# out rel 2.9e-6 apart on layer 0's q lora_A (v6.1 candidate); the same v6.1 code passed
+# test_real_width_stack_matches_v5_and_holds_less in one run and failed it in the next (layers.1
+# q lora_B with ref_a == ref_b, new != ref_a); v7 failed it again the same way, and
+# test_v6_no_leak's I3 cache test on layer 0's q lora_A (-3.7050e-04 vs -3.7074e-04, forward bit
+# for bit). Suspected source: torch's memory-efficient SDPA backward (non-deterministic by
+# default; from memory, torch source is not on disk); it is in the reference path of all three.
+# The forward stays deterministic and is still checked bit for bit (loss, hidden, RNG).
+# Bound: the derived LoRA-gradient tolerance of the K1/K3/K4 composition (test_unpad.py, comment
+# above check_against_base: each fp16 output may round to a neighbouring value, u = 2**-11, at most
+# 12 such roundings on a path, worst case 12 u = 5.9e-3 -> 1e-2 with margin, doubled for K1/K3/K4
+# -> 2e-2), the same 2e-2 test_v6_merged's merge test uses. A routing or cache bug moves a gradient by O(1)
+# (test_unpad test_grad_check_catches_misrouted_rows: rel ~1) or already breaks the forward.
+GRAD_RTOL = 2e-2
+
+
+def _assert_grad_close(ref_a, ref_b, new, name=""):
+    """A LoRA gradient of `new` against the reference run: bit for bit (True) or within GRAD_RTOL
+    (False). ref_b only labels the reference's own spread in the failure message."""
+    assert new.dtype == ref_a.dtype and new.shape == ref_a.shape, name
+    if _same(new, ref_a):
+        return True
+    err = tu.rel(new, ref_a)
+    assert err <= GRAD_RTOL, (name, err, tu.rel(ref_b, ref_a))
+    return False
+
+
 @pytest.fixture
 def sdpa_patch():
     """A's registry wrapper installed for the test, the registry put back afterwards."""
@@ -546,10 +575,13 @@ def _compare_runs(ref_a, ref_b, new):
     assert torch.equal(rnga, rngn)  # A, B and D draw no random numbers
     for s0, s1 in zip(reca["rng_pre"], recn["rng_pre"], strict=True):
         assert torch.equal(s0, s1)
+    # Forward: deterministic, so bit for bit (ref_a == ref_b there).
     _assert_matches(reca["hidden"], recb["hidden"], recn["hidden"], "hidden")
     _assert_matches(la, lb, ln, "loss")
+    # Backward: bit for bit or within GRAD_RTOL (the reference backward is not reproducible).
+    assert gn.keys() == ga.keys()
     for name in ga:
-        _assert_matches(ga[name], gb[name], gn[name], name)
+        _assert_grad_close(ga[name], gb[name], gn[name], name)
 
 
 def test_small_model_a_and_d_match_v5(forwards, sdpa_patch, monkeypatch):
@@ -591,8 +623,9 @@ def _install_k1_k3_s4(monkeypatch):
 
 
 def test_real_width_stack_matches_v5_and_holds_less(forwards, sdpa_patch, monkeypatch):
-    """K1 + K3 + K4 + S4 + U as in v5, then with B + A + D: same loss, hidden states and LoRA
-    gradients, and less memory held by autograd after the forward."""
+    """K1 + K3 + K4 + S4 + U as in v5, then with B + A + D: same loss and hidden states bit for
+    bit, LoRA gradients bit for bit or within GRAD_RTOL (the v5 backward itself is not
+    reproducible), and less memory held by autograd after the forward."""
     base, patched = forwards
     _install_k1_k3_s4(monkeypatch)
     calls = []
