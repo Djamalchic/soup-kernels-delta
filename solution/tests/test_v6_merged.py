@@ -188,8 +188,13 @@ def test_v6_merge_matches_v5_and_holds_less(v6_patches, monkeypatch):
     tp._assert_matches(ref_a["hidden"], ref_b["hidden"], new["hidden"], "hidden")
     tp._assert_matches(ref_a["loss"], ref_b["loss"], new["loss"], "loss")
     assert new["grads"].keys() == ref_a["grads"].keys()
+    # LoRA grads: A1 recomputes SDPA and runs its own backward, which reduces in a different order
+    # than the saved-graph backward, so v6 is not bit-exact with v5 here (hidden and loss above are).
+    # Same tolerance as the K1/K3/K4 composition in test_unpad (loss scaled by 2**16, at most a few
+    # dozen M-dependent fp16 roundings on any path to a LoRA grad); a misrouted row or a lost
+    # residual moves the grads by > 0.1 (test_unpad.test_grad_check_catches_misrouted_rows).
     for name in ref_a["grads"]:
-        tp._assert_matches(ref_a["grads"][name], ref_b["grads"][name], new["grads"][name], name)
+        assert tu.rel(new["grads"][name], ref_a["grads"][name]) <= 2e-2, name
 
     mask = batch["attention_mask"]
     rows, n = mask.numel(), int(mask.sum())
