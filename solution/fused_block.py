@@ -26,8 +26,13 @@ Saved per layer: 10 -> 6 bytes per element of [N, 1536] (-4 B: about -7.9 MiB pe
 -221 MiB over 28 layers at N = 1350, the N the v4 -> v5 peak difference implies [estimate]).
 Extra work per layer in backward: one K3 fwd launch over [N, 1536] and one fp32 -> fp16 cast.
 
-Every value is produced by the same op on the same operands as v5's path, so forward outputs and
-all gradients are bit-identical to it (tests/test_fused_block.py checks torch.equal). The
+Every value is produced by the same op on the same operands as the unfused path (v6's
+add_rmsnorm with the fp16 delta pointer + S4 MLP + add), so forward outputs and all gradients are
+bit-identical to it (tests/test_peak_v6.py test_fused_block_bit_exact_and_saves_less checks
+torch.equal). Against v5's fp32-pointer K3 launch y/rstd differ by a few fp32 ulp (see
+kernels/addnorm.py). Saving: on layer 0, r (the packed embeddings) has no grad, so no norm keeps
+it in v5, which holds r_mid + x16 there (6 B/elem) while B holds r + a (6 B/elem): no saving on
+layer 0, 27 layers count (~213 MiB, not 221). The
 chain-rule bookkeeping that autograd did between the three v5 nodes is reproduced explicitly:
   r_next = r_mid + f32(out16)      ->  d r_mid += d r_next,  d out16 = fp16(d r_next)
   x16 = fp16(y)                    ->  dy = f32(dx16)

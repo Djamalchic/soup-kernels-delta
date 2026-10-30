@@ -41,7 +41,8 @@ D. LoRA dropout masks and LoRA-A inputs on the padding rows (context around self
      the attention input is dropped by unpack_rows' backward (index_select of the real rows), so
      the mask's padding rows never reach anything that is kept;
    - every other tensor saved in there has another shape (SDPA 4-D [B, 12, T, 128], LoRA-B's
-     [P, 16], RoPE's cos/sin, K1's packed uint8 weights) and is kept as it is. bitsandbytes'
+     [P, 16], RoPE's cos/sin, K1's packed uint8 weights) and is kept as a detached alias of
+     itself (same storage; never the tensor itself, see _row_hooks: v6 fix). bitsandbytes'
      MatMul4Bit and K1 keep no activation (`_functions.py:356-359`, `kernels/nf4.py:408`).
    Saves 6 (P - N) x 1536 bytes per layer: ~6.1 MiB at P = 2048, N = 1350 -> ~172 MiB [estimate].
 
@@ -117,7 +118,12 @@ def _row_hooks(idx, batch, seq, width):
                 small = t.detach().reshape(rows, width).index_select(0, idx)
             COUNTS["rows_packed"] += 1
             return _Rows(small, t.shape)
-        return t
+        # Everything else is kept as a detached alias (same storage, same values), never as `t`
+        # itself: for a saved OUTPUT, `t` carries the grad_fn of the very node that owns the saved
+        # variable, a reference cycle that only that node's backward breaks. A1's throw-away
+        # forward graph (never back-propagated) leaked ~0.5 GiB per step this way before
+        # sdpa_recompute.py got its private hooks; detaching makes D safe for any such graph.
+        return t.detach()
 
     def unpack(obj):
         if isinstance(obj, _Rows):
@@ -168,21 +174,27 @@ class _Rep:
         self.n_rep = n_rep
 
 
-def _same_tensor(a, b):
-    return (a.dtype == b.dtype and a.shape == b.shape and a.stride() == b.stride()
-            and a.data_ptr() == b.data_ptr() and a.device == b.device)
+def _tensor_key(t):
+    return (t.data_ptr(), t.dtype, tuple(t.shape), t.stride(), t.device)
 
 
 def _kv_hooks(k16, v16, n_rep):
+    # The hooks live as long as the SavedVariables they packed (until backward), so they must not
+    # close over k16 / v16: that kept both full 12-head copies alive next to the small ones (A held
+    # MORE than base, test_sdpa_kv_compact on the T4). They keep plain identity keys instead; k16
+    # and v16 are alive for the whole SDPA call the hooks are entered for, so a key cannot be
+    # reused by another tensor while it matters.
+    keys = (_tensor_key(k16), _tensor_key(v16))
+    dtype, shape = k16.dtype, tuple(k16.shape)  # cheap checks first, as before
+
     def pack(t):
-        for ref in (k16, v16):
-            if _same_tensor(t, ref):
-                with torch.no_grad():
-                    # repeat_kv's layout: head h = kv * n_rep + j, every j a copy of j = 0.
-                    small = t.detach()[:, ::n_rep].contiguous()
-                COUNTS["kv_packed"] += 1
-                return _Rep(small, n_rep)
-        return t
+        if t.dtype == dtype and tuple(t.shape) == shape and _tensor_key(t) in keys:
+            with torch.no_grad():
+                # repeat_kv's layout: head h = kv * n_rep + j, every j a copy of j = 0.
+                small = t.detach()[:, ::n_rep].contiguous()
+            COUNTS["kv_packed"] += 1
+            return _Rep(small, n_rep)
+        return t.detach()  # never `t` itself (see _row_hooks)
 
     def unpack(obj):
         if isinstance(obj, _Rep):
@@ -249,7 +261,7 @@ def _sdpa_compact(module, query, key, value, attention_mask, dropout, scaling):
     k16 = key.to(torch.float16)
     v16 = value.to(torch.float16)
     del key, value
-    pack, unpack = _kv_hooks(k16, v16, n_rep)
+    pack, unpack = _kv_hooks(k16, v16, n_rep)  # holds keys, not k16 / v16
     with _hooks(pack, unpack):
         # Lines 108 + 124: with a mask is_causal is False; lines 158-167, no sdpa_kwargs (no GQA).
         attn_output = torch.nn.functional.scaled_dot_product_attention(

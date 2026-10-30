@@ -12,6 +12,8 @@ expected saving after the forward.
 CUDA only (Kaggle T4). Run from the repository root: python -m pytest solution -q
 """
 
+import gc
+
 import pytest
 import torch
 
@@ -119,6 +121,7 @@ def _run(pm, batch, forward, extra, seed=1234):
 
     hook = tu.inner_model(pm).register_forward_hook(on_model)
     try:
+        gc.collect()  # no earlier garbage freed inside the measured window
         torch.manual_seed(seed)
         torch.cuda.synchronize()
         start = torch.cuda.memory_allocated()
@@ -190,12 +193,16 @@ def test_v6_merge_matches_v5_and_holds_less(v6_patches, monkeypatch):
 
     mask = batch["attention_mask"]
     rows, n = mask.numel(), int(mask.sum())
-    per_layer = (4 * n * H                          # B: r_mid fp32 + x16 fp16 - a fp16, real rows
-                 + 6 * rows * H - 4 * rows * KV_HEADS * HEAD_DIM  # A1: 12-head k, v, out -> 2-head k, v
+    # Layer 0 has no grad into the stack (frozen embeddings): v5 keeps no norm input there, so B's
+    # (r, a) costs exactly v5's (r_mid, x16) on that layer, and its dropouts keep no mask (A2).
+    b_saving = 4 * n * H * (n_layers - 1)           # B: r_mid fp32 + x16 fp16 - a fp16, real rows
+    per_layer = (6 * rows * H - 4 * rows * KV_HEADS * HEAD_DIM  # A1: 12-head k, v, out -> 2-head
                  + 4 * (rows - n) * H)              # D: two fp16 LoRA-A inputs, padding rows
     a2_saving = 2 * rows * H * (n_layers - 1)       # A2: two bool masks where x needs grad
-    expect = n_layers * per_layer + a2_saving
+    expect = n_layers * per_layer + b_saving + a2_saving
     saved = ref_a["held"] - new["held"]
+    # Before the leak fix the T4 measured 11 980 800 B: A1's throw-away SDPA graph (k, v, out, lse,
+    # bias of every layer) stayed held through D's pass-through pack hook.
     assert saved >= 0.8 * expect, (ref_a["held"], new["held"], expect)
 
 

@@ -6,6 +6,7 @@ Run from the repository root on a T4: python -m pytest solution -q
 """
 
 import contextlib
+import gc
 
 import pytest
 import torch
@@ -78,6 +79,17 @@ def _w(seed=0):
     return (1.0 + 0.1 * torch.randn(H, device="cuda")).requires_grad_(False)
 
 
+# The fp16 delta pointer is a different compiled variant of the fwd kernel: the add is the same
+# single fp32 add (r bit for bit), but the fp16 load is vectorised differently and tl.sum adds the
+# 1536 squares in another order, so rstd and y differ from the fp32-pointer launch by a few fp32
+# ulp (Kaggle T4 run of 30.10: rows 77 and 2048 differed, rows 1 did not). That is a summation-order
+# difference, not a different formula; the tolerance below is the fp32 reduction bound we accept
+# (2e-6 relative ~ 17-34 fp32 ulp, far above the expected few ulp and 250x below the 4.9e-4
+# step of the fp16 cast that follows y). Within v6 every launch uses the fp16 variant, so the exact checks
+# (store_r, the bwd rebuild) stay exact.
+RTOL_ORDER = 2e-6
+
+
 @pytest.mark.parametrize("rows", [1, 77, 2048])
 def test_k3_fp16_delta_pointer_matches_fp32_cast(rows):
     w = _w()
@@ -86,7 +98,13 @@ def test_k3_fp16_delta_pointer_matches_fp32_cast(rows):
     r16, y16, s16 = addnorm._launch_fwd(r, d16, w, EPS)  # v6: fp16 pointer
     r32, y32, s32 = addnorm._launch_fwd(r, d16.float(), w, EPS)  # v5: Python-side fp32 cast
     assert torch.equal(r16, r + d16.float())
-    assert torch.equal(r16, r32) and torch.equal(y16, y32) and torch.equal(s16, s32)
+    assert torch.equal(r16, r32)  # the add itself is exact in both variants
+    torch.testing.assert_close(s16, s32, rtol=RTOL_ORDER, atol=0)
+    torch.testing.assert_close(y16, y32, rtol=RTOL_ORDER, atol=RTOL_ORDER)
+    # Both are the same RMSNorm: against an fp64 reference neither is more than a few ulp off.
+    ref_s = (r32.double().pow(2).mean(-1) + EPS).rsqrt()
+    torch.testing.assert_close(s16.double(), ref_s, rtol=RTOL_ORDER, atol=0)
+    torch.testing.assert_close(s32.double(), ref_s, rtol=RTOL_ORDER, atol=0)
     # store_r = 0: the same y and rstd, r not materialised.
     none, y_nr, s_nr = addnorm._launch_fwd(r, d16, w, EPS, store_r=False)
     assert none is None and torch.equal(y_nr, y16) and torch.equal(s_nr, s16)
@@ -110,14 +128,39 @@ def test_add_rmsnorm_fp16_delta_grad_dtype_and_value():
     d1 = d0.detach().clone().requires_grad_(True)
     res1, y1 = addnorm.add_rmsnorm(r1, d1.float(), w, EPS)
     torch.autograd.backward((res1, y1), (gr, gy))
-    assert torch.equal(res, res1) and torch.equal(y, y1)
+    assert torch.equal(res, res1)  # the add: exact
+    # y and the grads see rstd from the other fwd variant: summation order only (see RTOL_ORDER).
+    torch.testing.assert_close(y, y1, rtol=RTOL_ORDER, atol=RTOL_ORDER)
     assert d0.grad.dtype == torch.float16
-    assert torch.equal(r0.grad, r1.grad) and torch.equal(d0.grad, d1.grad)
+    torch.testing.assert_close(r0.grad, r1.grad, rtol=4 * RTOL_ORDER, atol=4 * RTOL_ORDER)
+    # The fp16 delta grad is the fp16 rounding of (nearly) the same fp32 value: equal, or one fp16
+    # step apart where the tiny fp32 difference crosses a rounding boundary.
+    torch.testing.assert_close(d0.grad, d1.grad, rtol=2.0 ** -10, atol=2.0 ** -24)
+    assert (d0.grad != d1.grad).float().mean().item() < 0.01
+    # Same variant on both sides: v6's add_rmsnorm is deterministic bit for bit.
+    r2 = r0.detach().clone().requires_grad_(True)
+    d2 = d0.detach().clone().requires_grad_(True)
+    res2, y2 = addnorm.add_rmsnorm(r2, d2, w, EPS)
+    torch.autograd.backward((res2, y2), (gr, gy))
+    assert torch.equal(y2, y) and torch.equal(r2.grad, r0.grad) and torch.equal(d2.grad, d0.grad)
 
 
 # ---------------------------------------------------------------------------------------------
 # S4: in-place SwiGLU backward
 # ---------------------------------------------------------------------------------------------
+
+def fp16_linear4bit(n_in, n_out, bias=False):
+    """bnb Linear4bit quantized from an fp16 weight, as from_pretrained(torch_dtype=fp16) leaves it:
+    quantize_4bit records the input dtype in quant_state.dtype (bitsandbytes functional.py:668-677,
+    Params4bit._quantize nn/modules.py:381-391, run by .cuda() via to() :424-428), and K1 only takes
+    fp16 states (solution/kernels/nf4.py:196-197). Built from the default fp32 weight, the state is
+    fp32, K1 refuses it and S4 falls back to bnb's fp32 dequant + .to(fp16), whose 52 MiB fp32
+    weight then sets the backward peak (that is why the in-place SwiGLU test saw no difference)."""
+    lin = bnb.nn.Linear4bit(n_in, n_out, bias=bias, compute_dtype=torch.float16,
+                            compress_statistics=True, quant_type="nf4")
+    lin.weight.data = lin.weight.data.to(torch.float16)  # as Params4bit.__new__ sets .data
+    return lin
+
 
 def _mlp(hidden=H, inter=8960, seed=0):
     torch.manual_seed(seed)
@@ -125,9 +168,11 @@ def _mlp(hidden=H, inter=8960, seed=0):
     mlp = mq.Qwen2MLP(cfg)
     for name, (n_in, n_out) in {"gate_proj": (hidden, inter), "up_proj": (hidden, inter),
                                 "down_proj": (inter, hidden)}.items():
-        setattr(mlp, name, bnb.nn.Linear4bit(n_in, n_out, bias=False, compute_dtype=torch.float16,
-                                             compress_statistics=True, quant_type="nf4"))
-    return mlp.cuda()
+        setattr(mlp, name, fp16_linear4bit(n_in, n_out))
+    mlp = mlp.cuda()
+    assert all(getattr(mlp, n).weight.quant_state.dtype == torch.float16
+               for n in ("gate_proj", "up_proj", "down_proj"))
+    return mlp
 
 
 @pytest.fixture
@@ -286,6 +331,9 @@ def _run_attn(fn, attn, leaves, mask, grad, scope=None):
     for t in leaves:
         t.grad = None
     q, k, v = (t.transpose(1, 2) for t in leaves)  # the [B, H, T, D] views Qwen2 passes
+    # Collect earlier tests' cyclic garbage first: otherwise Python's GC may free it in the middle
+    # of the measured forward (the T4 run measured ref held = -78.9 MB).
+    gc.collect()
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
     with scope if scope is not None else contextlib.nullcontext():
@@ -317,9 +365,32 @@ def test_sdpa_kv_compact_matches_original_and_saves_less(sdpa_patch, monkeypatch
     _assert_matches(ref_a[0], ref_b[0], new[0], "out")
     for name, ga, gb, gn in zip("qkv", ref_a[1], ref_b[1], new[1]):
         _assert_matches(ga, gb, gn, name)
-    # Each of k16, v16 [B, 12, T, 128] fp16 is kept as [B, 2, T, 128].
+    # Each of k16, v16 [B, 12, T, 128] fp16 is kept as [B, 2, T, 128]. Before the fix the pack
+    # hook closed over the full k16 / v16, so A held both copies (new = 29 458 432 B on the T4).
     expect = 2 * batch * 10 * seq * 128 * 2
+    assert ref_a[2] > 0 and new[2] > 0, (ref_a[2], new[2])  # a sane measurement
     assert ref_a[2] - new[2] >= 0.9 * expect, (ref_a[2], new[2], expect)
+
+
+def test_kv_hooks_hold_no_tensor():
+    k16 = torch.randn(2, 12, 8, 128, device="cuda", dtype=torch.float16)
+    v16 = torch.randn(2, 12, 8, 128, device="cuda", dtype=torch.float16)
+    pack, unpack = sc._kv_hooks(k16, v16, 6)
+
+    def tensors(obj):
+        if isinstance(obj, torch.Tensor):
+            return 1
+        if isinstance(obj, (tuple, list)):
+            return sum(tensors(o) for o in obj)
+        return 0
+
+    for fn in (pack, unpack):
+        assert not any(tensors(c.cell_contents) for c in (fn.__closure__ or ()))
+    handle = pack(k16)
+    assert isinstance(handle, sc._Rep) and handle.small.shape == (2, 2, 8, 128)
+    other = torch.randn(2, 12, 8, 128, device="cuda", dtype=torch.float16, requires_grad=True) * 1
+    kept = pack(other)
+    assert kept.grad_fn is None and kept.data_ptr() == other.data_ptr()
 
 
 def test_sdpa_wrapper_falls_back_outside_scope_and_on_odd_inputs(sdpa_patch, monkeypatch):
@@ -371,6 +442,7 @@ def _held_run(pm, batch, forward, **extra):
         held["bytes"] = torch.cuda.memory_allocated() - held["start"]
         return real_backward(self, *a, **k)
 
+    gc.collect()  # no earlier garbage freed inside the measured window
     torch.cuda.synchronize()
     held["start"] = torch.cuda.memory_allocated()
     torch.Tensor.backward = backward
@@ -404,9 +476,12 @@ def test_small_model_a_and_d_match_v5(forwards, sdpa_patch, monkeypatch):
     new = tu.run(pm, batch, patched)
     n_layers = pm.config.num_hidden_layers
     assert sc.COUNTS["sdpa_compact"] - c["sdpa_compact"] == n_layers
-    # Per layer: q and v LoRA-A inputs, plus the q and v keep-masks when torch saves them as bool
-    # (the fused native_dropout path); any other count means something unexpected was packed.
-    assert sc.COUNTS["rows_packed"] - c["rows_packed"] in (2 * n_layers, 4 * n_layers)
+    # Per layer: q and v LoRA-A inputs (always), plus the q and v keep-masks when torch saves them
+    # as bool (the fused native_dropout path). Layer 0's attention input comes from the frozen
+    # embeddings and needs no grad, so its dropout builds no node and keeps no mask: 2 there, 4 in
+    # every later layer (the T4 run counted 6 = 2 + 4 for 2 layers). Any other count means
+    # something unexpected was packed.
+    assert sc.COUNTS["rows_packed"] - c["rows_packed"] in (2 * n_layers, 4 * n_layers - 2)
     _compare_runs(ref_a, ref_b, new)
 
 
@@ -456,10 +531,13 @@ def test_real_width_stack_matches_v5_and_holds_less(forwards, sdpa_patch, monkey
 
     mask = batch["attention_mask"]
     rows, n = mask.numel(), int(mask.sum())
-    per_layer = (4 * n * H                      # B: r_mid (fp32) + x16 (fp16) - a (fp16)
-                 + 2 * rows * (H - 256) * 2     # A: k16, v16 keep 2 of 12 heads
-                 + 6 * (rows - n) * H)          # D: 2 x (bool mask + fp16 input) padding rows
-    assert held_a - held_n >= 0.8 * n_layers * per_layer, (held_a, held_n, per_layer)
+    # Layer 0 (frozen embeddings, no grad into the stack) saves less in v5 already: no norm keeps
+    # its r, so B's (r, a) costs what v5's (r_mid, x16) costs there, and its dropouts keep no mask.
+    expect = (n_layers - 1) * 4 * n * H              # B: r_mid fp32 + x16 fp16 - a fp16, real rows
+    expect += n_layers * 2 * rows * (H - 256) * 2    # A: k16, v16 keep 2 of 12 heads
+    expect += n_layers * 4 * (rows - n) * H          # D: two fp16 LoRA-A inputs, padding rows
+    expect += (n_layers - 1) * 2 * (rows - n) * H    # D: two bool masks, padding rows (layer >= 1)
+    assert held_a - held_n >= 0.8 * expect, (held_a, held_n, expect)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -487,8 +565,14 @@ def test_row_hooks_roundtrip(dtype, two_d):
     back = unpack(handle)
     assert back.shape == t.shape and back.dtype == t.dtype and back.is_contiguous()
     assert torch.equal(back, t)
-    # Anything else is passed through untouched.
-    other = torch.randn(batch, 12, seq, 128, device="cuda", dtype=torch.float16)
-    assert pack(other) is other and unpack(other) is other
+    # Anything else is kept as a detached alias: same storage and values, but never the tensor
+    # itself, whose grad_fn would close a reference cycle for a saved output (the v6 OOM).
+    other = (torch.randn(batch, 12, seq, 128, device="cuda", dtype=torch.float16)
+             .requires_grad_(True) * 1)  # a non-leaf with a grad_fn, like a saved output
+    kept = pack(other)
+    assert kept is not other and kept.grad_fn is None and not kept.requires_grad
+    assert kept.data_ptr() == other.data_ptr() and kept.shape == other.shape
+    assert unpack(kept) is kept
     f32 = torch.randn(batch, seq, width, device="cuda")
-    assert pack(f32) is f32
+    kept = pack(f32)
+    assert kept.data_ptr() == f32.data_ptr() and kept.dtype == f32.dtype

@@ -15,7 +15,12 @@ dtype (bitsandbytes/nn/modules.py:626, 637) and peft's LoRA adds an fp16 update 
 
 v6 (peak-timing variant): the delta pointer is fp16. The kernels load it and widen it to fp32
 (exact), which is the value base's type-promoting add uses, so r = residual + f32(delta) is the
-same fp32 add as before; the Python-side fp32 copy of the delta (alive during the launch) is gone.
+same fp32 add as before (bit for bit); the Python-side fp32 copy of the delta (alive during the
+launch) is gone. y and rstd are NOT bit-identical to v5's fp32-pointer launch: the fp16 load is
+vectorised differently, so Triton compiles another register layout and tl.sum adds the 1536
+squares in another order (a few fp32 ulp on rstd, Kaggle T4: test_peak_v6 rows 77 / 2048). This is
+the same kind of difference v5 itself has against torch's RMSNorm; within v6 every forward and
+recompute uses this one variant, so forward and backward stay consistent.
 The rmsnorm-only paths pass a one-element fp16 dummy for the delta, so in training every pointer
 keeps one dtype and each kernel still compiles once (an fp32 delta, which no training path
 produces, would add a second variant). New runtime flags, all in do_not_specialize:

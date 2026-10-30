@@ -66,9 +66,12 @@ def run(fn, qkv, mask, dout, autocast=True, **kw):
     saved = {}
 
     def pack(t):
+        # Counts what autograd keeps for backward. A1's throw-away forward graph runs under its
+        # own innermost hooks (sdpa_recompute._private_saves), so it is not counted here any more;
+        # on the T4 the old code gave 5 240 848 B = A1's 1 609 728 + that graph's 3 631 120.
         st = t.untyped_storage()
         saved[st.data_ptr()] = st.nbytes()
-        return t
+        return t.detach()  # never `t`: a saved output would keep its own node alive (cycle)
 
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
         with torch.autocast("cuda", dtype=torch.float16, enabled=autocast):

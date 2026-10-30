@@ -63,7 +63,7 @@ def step(layers, x0, enabled, seed=1234, autocast=True, hooks=()):
     def pack(t):
         st = t.untyped_storage()
         saved[st.data_ptr()] = (st.nbytes(), t.dtype)
-        return t
+        return t.detach()  # never `t`: a saved output would keep its own node alive (cycle)
 
     torch.manual_seed(seed)
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):

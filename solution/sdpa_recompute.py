@@ -38,10 +38,26 @@ dtype, q_len == kv_len, heads = kv_heads * num_key_value_groups; transformers' o
 use_gqa_in_sdpa(...) says "repeat"; compute dtype fp16 (fp16 inputs with autocast off or fp16, or
 fp32 inputs under fp16 autocast). No Triton kernel and no CUDA work at import or patch time.
 
+Private saves (v6 fix, the step-22 OOM on Kaggle): the forward builds a throw-away SDPA graph
+(grad-requiring leaves, so SDPA takes its training variant) that is never back-propagated. Default
+saved-tensor hooks are thread-local and also apply inside a custom Function's forward, so any outer
+hook (solution/saved_compact.py's D scope around self_attn, Soup/TRL activation offloading, a test's
+counter) used to see that graph's saves. SDPA's node saves its own OUTPUTS (out, logsumexp); an
+outer pack hook that returns the tensor itself stores the output with its grad_fn, i.e. the node
+that owns the saved variable: a C++ reference cycle that only backward's release breaks and
+Python's GC cannot see. This graph never gets a backward, so q, the 12-head k/v, out, lse and the
+bias of every layer stayed alive forever (~12 KiB per padded token per layer, ~0.5 GiB per
+step). The inner calls now run under our own innermost hooks (`_private_saves`), which keep a
+detached alias (no grad_fn, no cycle; SavedVariable rebuilds the autograd metadata on unpack), so
+outer hooks only ever see what `_SDPARecompute` itself saves (q16, k16, v16, mask) and the throw-away graph is freed with
+`res`. Same values: hooks only decide how a saved tensor is stored.
+
 Idea credit: activation recomputation (Chen et al. 2016, arXiv:1604.06174) applied to the attention
 core only, as in Korthikanti et al. 2022 "Reducing Activation Recomputation in Large Transformer
 Models" (arXiv:2205.05198, selective recomputation). Code written from scratch.
 """
+
+import contextlib
 
 import torch
 
@@ -84,6 +100,36 @@ def _compiling():
         return True
 
 
+def _detached(t):
+    # A pack hook must not return its input: for a saved output that would store the grad_fn of
+    # the node that owns the saved variable (a reference cycle). A detached alias shares storage
+    # and version counter; unpack restores grad_fn / requires_grad from the saved metadata.
+    return t.detach()
+
+
+def _same(t):
+    return t
+
+
+@contextlib.contextmanager
+def _private_saves():
+    """Innermost saved-tensor hooks around our inner SDPA calls, so no outer hook sees (or keeps)
+    the tensors those calls save. If hooks cannot be pushed here (e.g. inside
+    torch.autograd.graph.disable_saved_tensors_hooks, where no outer hook can be active either),
+    run without them."""
+    cm = None
+    try:
+        cm = torch.autograd.graph.saved_tensors_hooks(_detached, _same)
+        cm.__enter__()
+    except Exception:  # noqa: BLE001
+        cm = None
+    try:
+        yield
+    finally:
+        if cm is not None:
+            cm.__exit__(None, None, None)
+
+
 def _sdpa(q, k, v, mask, scale):
     # The call of sdpa_attention_forward (integrations/sdpa_attention.py:158-167) with a mask:
     # dropout 0 (guarded), is_causal False (:124), no enable_gqa (k, v already repeated).
@@ -104,7 +150,9 @@ class _SDPARecompute(torch.autograd.Function):
         # Run with grad-requiring leaves, as base does: SDPA then takes the same training variant
         # (it also computes the logsumexp it needs for backward), so out has base's bits. The
         # little graph built here is dropped with `res`; only the detached output leaves.
-        with torch.enable_grad(), torch.autocast(query.device.type, enabled=False):
+        # _private_saves: outer hooks (D's scope, offloading) must not see or keep this graph.
+        device_type = query.device.type
+        with torch.enable_grad(), torch.autocast(device_type, enabled=False), _private_saves():
             q = q16.detach().requires_grad_(True)
             k = repeat_kv(k16, n_rep).detach().requires_grad_(True)
             v = repeat_kv(v16, n_rep).detach().requires_grad_(True)
@@ -126,7 +174,7 @@ class _SDPARecompute(torch.autograd.Function):
         q16, k16, v16, mask = ctx.saved_tensors
         n_rep, scale = ctx.n_rep, ctx.scale
         repeat_kv = _REFS["repeat_kv"]
-        with torch.enable_grad(), torch.autocast(q16.device.type, enabled=False):
+        with torch.enable_grad(), torch.autocast(q16.device.type, enabled=False), _private_saves():
             q = q16.detach().requires_grad_(need[0])
             k = repeat_kv(k16, n_rep).detach().requires_grad_(need[1])
             v = repeat_kv(v16, n_rep).detach().requires_grad_(need[2])

@@ -22,8 +22,9 @@ touch CUDA, compile kernels or change any setting.
   run in vocabulary tiles without the [B, T, V] logits; TRL's metrics and Soup's rewind log read
   the same numbers from a soup_cli ChunkedStep.
 
-v6 (memory at the step's peak, every one bit-identical to v5 or to base, every one guarded with
-a fallback to the v5 ops):
+v6 (memory at the step's peak, every one guarded with a fallback to the v5 ops; same values as v5
+except K3's fp16 delta pointer, which changes the norm's fp32 summation order by a few ulp, and
+A1's SDPA backward, which is only as deterministic as torch's):
 - B, `solution/fused_block.py`: on U's packed path, add + norm + S4 MLP + residual add as one
   autograd node that saves (r, fp16 a) instead of (r_mid, x16).
 - A1, `solution/sdpa_recompute.py`: SDPA keeps fp16 q and the un-repeated k, v and recomputes its
