@@ -324,3 +324,114 @@ def test_patch_is_idempotent(monkeypatch):
 
     assert bnb.matmul_4bit is nf4.soup_matmul_4bit
     assert nf4._get_original_matmul_4bit() is saved_original
+
+
+# --- K1 v3s: kernel layout limits, fallback, validation cache, rules -------
+
+# (3, 40): 120 elements, one program with 15 of its 256 rows live and a
+# partial 64-block. (1, 8): a single 4-byte group. (5, 1536): partial program.
+# (7, 9): 63 elements, numel % 8 != 0, takes the torch fallback.
+RAGGED_SHAPES = ((3, 40), (1, 8), (5, 1536), (7, 9))
+
+
+@pytest.mark.parametrize("shape", RAGGED_SHAPES)
+def test_ragged_shapes_bit_exact(shape):
+    generator = torch.Generator(device="cuda").manual_seed(1000 + shape[1])
+    weight = torch.randn(
+        shape, device="cuda", dtype=torch.float16, generator=generator
+    )
+    packed, state = quantize(weight)
+    expected = bnb.functional.dequantize_4bit(packed, quant_state=state)
+    assert_bit_exact(nf4.nf4_dequantize(packed, state), expected)
+
+
+@pytest.mark.parametrize("offset", (0, 1, 2, 8))
+def test_out_slice_offsets_stay_in_bounds(offset):
+    # offset 1: odd start, goes through a temporary; offset 2: 4-byte aligned
+    # int32 view (extra Triton specialization, tests only); 0 and 8: aligned.
+    generator = torch.Generator(device="cuda").manual_seed(5 + offset)
+    weight = torch.randn(
+        (3, 40), device="cuda", dtype=torch.float16, generator=generator
+    )
+    packed, state = quantize(weight)
+    expected = bnb.functional.dequantize_4bit(packed, quant_state=state)
+
+    backing = torch.full(
+        (offset + 120 + 8,), 123.0, device="cuda", dtype=torch.float16
+    )
+    output = backing[offset:offset + 120].view(3, 40)
+    result = nf4.nf4_dequantize(packed, state, out=output)
+
+    assert result is output
+    assert_bit_exact(result, expected)
+    assert bool((backing[:offset] == 123.0).all())
+    assert bool((backing[offset + 120:] == 123.0).all())
+
+
+def test_model_shapes_take_the_kernel(quantized_weights, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Qwen2.5 shapes must not take the torch fallback")
+
+    monkeypatch.setattr(nf4, "_torch_dequant", forbidden)
+    for shape in SHAPES:
+        packed, state = quantized_weights[shape]
+        expected = bnb.functional.dequantize_4bit(packed, quant_state=state)
+        assert_bit_exact(nf4.nf4_dequantize(packed, state), expected)
+
+
+def test_validation_cache_revalidates_changes(quantized_weights):
+    import copy
+
+    packed, state = quantized_weights[(256, 1536)]
+    expected = bnb.functional.dequantize_4bit(packed, quant_state=state)
+
+    cached = copy.copy(state)
+    assert_bit_exact(nf4.nf4_dequantize(packed, cached), expected)
+    assert_bit_exact(nf4.nf4_dequantize(packed, cached), expected)  # hit
+
+    cached.dtype = torch.float32
+    with pytest.raises(TypeError, match="quant_state.dtype"):
+        nf4.nf4_dequantize(packed, cached)
+    cached.dtype = torch.float16
+    assert_bit_exact(nf4.nf4_dequantize(packed, cached), expected)
+
+    original_absmax = cached.absmax
+    cached.absmax = original_absmax[:-1]
+    with pytest.raises(ValueError, match="quant_state.absmax"):
+        nf4.nf4_dequantize(packed, cached)
+    cached.absmax = original_absmax.clone()
+    assert_bit_exact(nf4.nf4_dequantize(packed, cached), expected)
+
+    cached.shape = torch.Size((128, 1536))
+    with pytest.raises(ValueError, match="packed size"):
+        nf4.nf4_dequantize(packed, cached)
+    cached.shape = state.shape
+
+    with pytest.raises(ValueError, match="packed size"):
+        nf4.nf4_dequantize(packed[:-1], cached)
+    assert_bit_exact(nf4.nf4_dequantize(packed, cached), expected)
+
+
+def test_single_soup_kernel_far_from_example(monkeypatch):
+    # Uses the harness's own rule code (read-only import).
+    import importlib.util
+    import pathlib
+    import sys
+
+    repo = pathlib.Path(nf4.__file__).resolve().parents[2]
+    rules_path = repo / "harness" / "check_rules.py"
+    if not rules_path.exists():
+        pytest.skip("harness/check_rules.py not found")
+
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    had_common = "common" in sys.modules
+    spec = importlib.util.spec_from_file_location("_soup_check_rules", rules_path)
+    rules = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(rules)
+        _, kernels = rules.triton_kernels(nf4.__file__)
+        assert [node.name for node in kernels] == ["soup_nf4_dequant_kernel"]
+        assert rules.example_likeness(kernels[0]) < rules.EXAMPLE_REVIEW
+    finally:
+        if not had_common:
+            sys.modules.pop("common", None)

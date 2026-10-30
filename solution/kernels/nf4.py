@@ -1,9 +1,35 @@
-"""NF4 dequantization and a guarded bitsandbytes matmul replacement.
+"""NF4 dequantization (K1 v3s) and a guarded bitsandbytes matmul replacement.
 
 Importing this module performs no CUDA queries or allocations.
+
+Kernel layout. One program owns ROWS consecutive 4-byte groups of the packed
+weight (ROWS * 4 bytes -> ROWS * 8 fp16 outputs). Tiles are [ROWS, 4]: dim 1 is
+the 4 bytes a thread reads with one 32-bit load, dim 0 is a "row" vector that
+carries the per-group metadata (one absmax per 4 bytes). Each byte b gives the
+fp16 pair (nf4[b >> 4] * absmax, nf4[b & 15] * absmax); the pair is packed into
+one int32 (even element in the low half, little-endian) and stored through an
+int32 view of the output, so each thread stores 16 contiguous bytes.
+
+The bounds mask is per row and broadcast along dim 1. The size argument is in
+do_not_specialize, so Triton cannot assume it is a multiple of 16; a per-element
+mask would then defeat vectorisation. A row mask is constant along dim 1 for
+any size, so the load and store stay vectorised.
+
+The 16-entry NF4 table is a 4-level select tree on the nibble bits (15 selects
+per value, no table memory traffic). Its constants are the fp32 values of
+bitsandbytes' `nf4_dequantization_lut` (csrc/kernels.cu:26-43).
+
+Idea credit: the tile (one absmax per thread, one packed byte -> two outputs,
+1-2K outputs per CTA) follows bitsandbytes kDequantizeBlockwise
+(csrc/kernels.cu:465-528, launch csrc/ops.cu:78-95). The code is our own.
+
+Measured on a Kaggle T4 (results/measurements.md, 30.10, median of 7 x 200
+calls): 0.166 / 0.030 / 0.029 ms on [8960,1536] / [1536,1536] / [256,1536],
+bit-exact with bitsandbytes.functional.dequantize_4bit; K1 v1 was 0.289 /
+0.050 / 0.051, bnb's full dequantize_4bit 0.300 / 0.083 / 0.081.
 """
 
-from functools import lru_cache
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -11,13 +37,18 @@ import triton
 import triton.language as tl
 
 
-# One launch configuration. Four warps process eight output elements per
-# thread: enough contiguous work to amortize metadata loads while keeping
-# register pressure modest on T4. This is a bandwidth-oriented starting point,
-# not an empirically tuned configuration.
-_BLOCK = 1024
+# Fixed launch configuration for sm_75 (T4), the one that was measured.
+# 4 warps = 128 threads; ROWS=256 groups -> 2 groups per thread, 1024 packed
+# bytes and 2048 fp16 outputs per program. 2048 % ROWS == 0 keeps each program
+# inside one second-level absmax group (256 blocks * 64 = 2048 groups).
+_ROWS = 256
 _NUM_WARPS = 4
 
+# The kernel indexes bytes and output words in int32.
+_MAX_KERNEL_COUNT = 2**31
+
+# Used only by the torch fallback (numel % 8 != 0 or huge weights). Same fp32
+# values as bitsandbytes csrc/kernels.cu:26-43 and as the kernel's select tree.
 _NF4_VALUES = (
     -1.0,
     -0.6961928009986877,
@@ -40,48 +71,90 @@ _NF4_VALUES = (
 _ORIGINAL_BNB_MATMUL_4BIT = None
 
 
-@triton.jit(do_not_specialize=["n_elements"])
+@triton.jit(do_not_specialize=["n_groups"])
 def soup_nf4_dequant_kernel(
-    Packed,
-    Abs8,
-    Abs2,
-    Code2,
-    Offset,
-    Lut,
-    Output,
-    n_elements,
-    BLOCK: tl.constexpr,
+    Packed,  # uint8 [n_groups * 4]
+    Abs8,  # uint8 [blocks], one code per 64 outputs (= 8 groups)
+    Abs2,  # fp32 [ceil(blocks / 256)]
+    Code2,  # fp32 [256]
+    Offset,  # fp32 [1]
+    Out32,  # int32 view of the fp16 output, [n_groups * 4]
+    n_groups,  # numel // 8
+    ROWS: tl.constexpr,
 ):
-    e = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    valid = e < n_elements
+    tl.static_assert(2048 % ROWS == 0)
 
-    byte = tl.load(Packed + e // 2, mask=valid, other=0).to(tl.int32)
-    nibble = tl.where((e & 1) == 0, byte >> 4, byte & 15)
+    start = tl.program_id(0) * ROWS
+    row = start + tl.arange(0, ROWS)
+    row_ok = row < n_groups
+    idx = row[:, None] * 4 + tl.arange(0, 4)[None, :]  # byte == output word
+    ok = tl.broadcast_to(row_ok[:, None], (ROWS, 4))
 
-    block = e // 64
-    abs_code = tl.load(Abs8 + block, mask=valid, other=0).to(tl.int32)
-    code = tl.load(Code2 + abs_code, mask=valid, other=0)
-    scale = tl.load(Abs2 + block // 256, mask=valid, other=0)
+    # absmax of the row's 64-element block, double-dequantized. Two separate
+    # fp32 roundings as in bnb (dequantize_blockwise, then `absmax += offset`,
+    # bitsandbytes/functional.py:1052-1054); the launcher passes
+    # enable_fp_fusion=False so this is not contracted into an FMA.
+    abs_code = tl.load(Abs8 + (row >> 3), mask=row_ok, other=0).to(tl.int32)
+    code = tl.load(Code2 + abs_code, mask=row_ok, other=0.0)
+    scale = tl.load(Abs2 + (start >> 11))
     offset = tl.load(Offset)
+    a = (code * scale + offset)[:, None]
 
-    # Both operations are fp32. The launcher MUST disable FP fusion so the
-    # multiplication rounds before the addition.
-    scaled_code = code * scale
-    absmax = scaled_code + offset
+    q = tl.load(Packed + idx, mask=ok, other=0).to(tl.int32)
 
-    value = tl.load(Lut + nibble, mask=valid, other=0)
-    result = (value * absmax).to(tl.float16, fp_downcast_rounding="rtne")
-    tl.store(Output + e, result, mask=valid)
+    # High nibble (element 2i): bits 4..7. Leaf order follows the table index.
+    h1 = (q & 0x10) != 0
+    h2 = (q & 0x20) != 0
+    h4 = (q & 0x40) != 0
+    h8 = (q & 0x80) != 0
+    vh = tl.where(
+        h8,
+        tl.where(
+            h4,
+            tl.where(h2, tl.where(h1, 1.0, 0.7229568362236023),
+                     tl.where(h1, 0.5626170039176941, 0.44070982933044434)),
+            tl.where(h2, tl.where(h1, 0.33791524171829224, 0.24611230194568634),
+                     tl.where(h1, 0.16093020141124725, 0.07958029955625534)),
+        ),
+        tl.where(
+            h4,
+            tl.where(h2, tl.where(h1, 0.0, -0.09105003625154495),
+                     tl.where(h1, -0.18477343022823334, -0.28444138169288635)),
+            tl.where(h2, tl.where(h1, -0.39491748809814453, -0.5250730514526367),
+                     tl.where(h1, -0.6961928009986877, -1.0)),
+        ),
+    ).to(tl.float32)
 
+    # Low nibble (element 2i + 1): bits 0..3.
+    l1 = (q & 0x1) != 0
+    l2 = (q & 0x2) != 0
+    l4 = (q & 0x4) != 0
+    l8 = (q & 0x8) != 0
+    vl = tl.where(
+        l8,
+        tl.where(
+            l4,
+            tl.where(l2, tl.where(l1, 1.0, 0.7229568362236023),
+                     tl.where(l1, 0.5626170039176941, 0.44070982933044434)),
+            tl.where(l2, tl.where(l1, 0.33791524171829224, 0.24611230194568634),
+                     tl.where(l1, 0.16093020141124725, 0.07958029955625534)),
+        ),
+        tl.where(
+            l4,
+            tl.where(l2, tl.where(l1, 0.0, -0.09105003625154495),
+                     tl.where(l1, -0.18477343022823334, -0.28444138169288635)),
+            tl.where(l2, tl.where(l1, -0.39491748809814453, -0.5250730514526367),
+                     tl.where(l1, -0.6961928009986877, -1.0)),
+        ),
+    ).to(tl.float32)
 
-@lru_cache(maxsize=None)
-def _device_lut(device_index):
-    # Lazy, once per device. No CUDA work happens at module import.
-    return torch.tensor(
-        _NF4_VALUES,
-        dtype=torch.float32,
-        device=torch.device("cuda", device_index),
-    )
+    # fp32 multiply, one rtne rounding to fp16, as bnb's
+    # `vals[j*2] = dDequantizeNF4(q >> 4) * local_abs_max` (csrc/kernels.cu:517-522).
+    h = (vh * a).to(tl.float16, fp_downcast_rounding="rtne")
+    l = (vl * a).to(tl.float16, fp_downcast_rounding="rtne")
+    hb = h.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    lb = l.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
+    tl.store(Out32 + idx, hb | (lb << 16), mask=ok)
 
 
 def _check_tensor(tensor, name, dtype, device, count, *, vector=False):
@@ -175,6 +248,116 @@ def _validate_inputs(packed, quant_state):
     return n, k
 
 
+# Validation cache: id(quant_state) -> what was validated. A hit requires the
+# same live quant_state and packed objects, the same packed storage pointer,
+# the same metadata tensor objects and the same scalar fields; anything else
+# re-runs the full validation. Entries drop out when their quant_state dies
+# (weakref callback). packed is held weakly; the small metadata tensors are held
+# strongly only while their quant_state is alive (it holds them too).
+# Not detected: in-place resize_/set_ of a metadata tensor (never done to bnb
+# quant states during training).
+_VALID = {}
+_VALID_LIMIT = 4096
+
+
+def _signature(quant_state, state2):
+    return (
+        getattr(quant_state, "quant_type", None),
+        getattr(quant_state, "blocksize", None),
+        getattr(quant_state, "nested", None),
+        getattr(quant_state, "dtype", None),
+        getattr(quant_state, "shape", None),
+        getattr(state2, "blocksize", None),
+    )
+
+
+def _checked_shape(packed, quant_state):
+    """(n, k) of a valid NF4 weight; raises TypeError/ValueError otherwise."""
+    entry = _VALID.get(id(quant_state))
+    if entry is not None:
+        qs_ref, packed_ref, ptr, absmax, state2, abs2, code2, offset, sig, nk = entry
+        s2 = getattr(quant_state, "state2", None)
+        if (
+            qs_ref() is quant_state
+            and packed_ref() is packed
+            and s2 is state2
+            and getattr(quant_state, "absmax", None) is absmax
+            and getattr(quant_state, "offset", None) is offset
+            and getattr(s2, "absmax", None) is abs2
+            and getattr(s2, "code", None) is code2
+            and packed.data_ptr() == ptr
+            and _signature(quant_state, s2) == sig
+        ):
+            return nk
+
+    n, k = _validate_inputs(packed, quant_state)
+
+    key = id(quant_state)
+    try:
+        qs_ref = weakref.ref(
+            quant_state, lambda _ref, key=key, cache=_VALID: cache.pop(key, None)
+        )
+        packed_ref = weakref.ref(packed)
+    except TypeError:
+        return n, k  # not weak-referenceable: validate every call
+    if len(_VALID) >= _VALID_LIMIT:
+        _VALID.clear()
+    state2 = quant_state.state2
+    sig = _signature(quant_state, state2)
+    sig = sig[:4] + (tuple(sig[4]),) + sig[5:]  # snapshot of a mutable shape
+    _VALID[key] = (
+        qs_ref,
+        packed_ref,
+        packed.data_ptr(),
+        quant_state.absmax,
+        state2,
+        state2.absmax,
+        state2.code,
+        quant_state.offset,
+        sig,
+        (n, k),
+    )
+    return n, k
+
+
+def _torch_dequant(packed, quant_state, n, k):
+    # Bit-exact torch path for sizes the kernel does not take (numel % 8 != 0
+    # or >= 2^31 elements); no Qwen2.5 projection lands here. Same arithmetic
+    # as bnb: code2[abs8] * abs2 then + offset in fp32 (two roundings), then
+    # nf4 * absmax in fp32 rounded to fp16.
+    count = n * k
+    state2 = quant_state.state2
+    flat = packed.reshape(-1)
+    nib = torch.stack((flat >> 4, flat & 15), dim=1).reshape(-1)[:count].long()
+    blocks = (count + 63) // 64
+    absmax = state2.code[quant_state.absmax.long()]
+    absmax = absmax * state2.absmax.repeat_interleave(256)[:blocks]
+    absmax = absmax + quant_state.offset.reshape(())
+    lut = torch.tensor(_NF4_VALUES, dtype=torch.float32, device=packed.device)
+    values = lut[nib] * absmax.repeat_interleave(64)[:count]
+    return values.to(torch.float16).view(n, k)
+
+
+def _launch(packed, quant_state, count, out):
+    out32 = out.view(-1).view(torch.int32)
+    n_groups = count // 8
+    # The caller must provide output storage disjoint from the input metadata.
+    # This context selects the device without creating a stream.
+    with torch.cuda.device(packed.device):
+        soup_nf4_dequant_kernel[(triton.cdiv(n_groups, _ROWS),)](
+            packed,
+            quant_state.absmax,
+            quant_state.state2.absmax,
+            quant_state.state2.code,
+            quant_state.offset,
+            out32,
+            n_groups,
+            ROWS=_ROWS,
+            num_warps=_NUM_WARPS,
+            enable_fp_fusion=False,
+        )
+
+
 def nf4_dequantize(packed, quant_state, out=None):
     """Return a contiguous [N, K] fp16 tensor, optionally writing into out.
 
@@ -185,36 +368,37 @@ def nf4_dequantize(packed, quant_state, out=None):
         nf4_dequantize(up, up_state, out=buffer[8960:])
 
     These are two launches of the same kernel; each launch uses its weight's
-    own quantization metadata.
+    own quantization metadata. An `out` whose start is not 16-byte aligned
+    works, but Triton compiles a second specialization for it; an odd element
+    offset goes through a temporary.
     """
-    n, k = _validate_inputs(packed, quant_state)
+    n, k = _checked_shape(packed, quant_state)
+    count = n * k
 
-    if out is None:
-        out = torch.empty((n, k), device=packed.device, dtype=torch.float16)
-    else:
-        _check_tensor(out, "out", torch.float16, packed.device, n * k)
+    if out is not None:
+        _check_tensor(out, "out", torch.float16, packed.device, count)
         if tuple(out.shape) != (n, k):
             raise ValueError(f"out must have shape {(n, k)}")
         if out.requires_grad:
             raise ValueError("out must not require gradients")
 
-    # The caller must provide output storage disjoint from the input metadata.
-    # This context selects the device without creating a stream.
-    with torch.cuda.device(packed.device):
-        lut = _device_lut(packed.device.index)
-        soup_nf4_dequant_kernel[(triton.cdiv(n * k, _BLOCK),)](
-            packed,
-            quant_state.absmax,
-            quant_state.state2.absmax,
-            quant_state.state2.code,
-            quant_state.offset,
-            lut,
-            out,
-            n * k,
-            BLOCK=_BLOCK,
-            num_warps=_NUM_WARPS,
-            enable_fp_fusion=False,
-        )
+    if count % 8 != 0 or count >= _MAX_KERNEL_COUNT:
+        result = _torch_dequant(packed, quant_state, n, k)
+        if out is None:
+            return result
+        out.copy_(result)
+        return out
+
+    if out is None:
+        out = torch.empty((n, k), device=packed.device, dtype=torch.float16)
+    elif out.storage_offset() % 2 != 0:
+        # An int32 view needs a 4-byte aligned start.
+        tmp = torch.empty((n, k), device=packed.device, dtype=torch.float16)
+        _launch(packed, quant_state, count, tmp)
+        out.copy_(tmp)
+        return out
+
+    _launch(packed, quant_state, count, out)
     return out
 
 
@@ -257,6 +441,9 @@ def _get_original_matmul_4bit():
 
 
 def soup_matmul_4bit(A, B, quant_state, out=None, bias=None):
+    # Same signature as bitsandbytes/autograd/_functions.py:407 matmul_4bit,
+    # which Linear4bit.forward reaches as `bnb.matmul_4bit`
+    # (bitsandbytes/nn/modules.py:637).
     original = _get_original_matmul_4bit()
 
     if (
@@ -269,7 +456,7 @@ def soup_matmul_4bit(A, B, quant_state, out=None, bias=None):
         return original(A, B, quant_state=quant_state, out=out, bias=bias)
 
     try:
-        n, k = _validate_inputs(B, quant_state)
+        n, k = _checked_shape(B, quant_state)
     except (TypeError, ValueError):
         return original(A, B, quant_state=quant_state, out=out, bias=bias)
 
@@ -280,6 +467,9 @@ def soup_matmul_4bit(A, B, quant_state, out=None, bias=None):
     if m <= 4:
         return original(A, B, quant_state=quant_state, out=out, bias=bias)
 
+    # bnb takes dequant + F.linear for M > 1536 and otherwise asks its private
+    # heuristic (bitsandbytes/backends/cuda/ops.py:921-926, 954-964); we only
+    # replace the dequant + F.linear path.
     if m <= 1536:
         try:
             from bitsandbytes.backends.cuda.ops import (
