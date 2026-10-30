@@ -55,6 +55,25 @@ outer hooks only ever see what `_SDPARecompute` itself saves (q16, k16, v16, mas
 Idea credit: activation recomputation (Chen et al. 2016, arXiv:1604.06174) applied to the attention
 core only, as in Korthikanti et al. 2022 "Reducing Activation Recomputation in Large Transformer
 Models" (arXiv:2205.05198, selective recomputation). Code written from scratch.
+
+v7 I1, causal-only SDPA on U's packed path (USE_CAUSAL_PADDED, off unless solution.apply() sets
+it). solution/unpad.py builds the [B, 1, T, T] bool mask with transformers' genuine
+create_causal_mask from a 2D mask it has validated on the device as binary, right-padded and with a
+real first token in every row (unpad.py _row_indices), and enters `causal_mask_scope(mask)` around
+its layer loop. With no or/and mask function, no block ids and a 2D mask (so no packed-sequence
+mask, masking_utils.py:851-857), that mask is causal AND padding (masking_utils.py:496-518):
+mask[b, 0, i, j] = (j <= i) and (j < L_b). For a REAL query row i < L_b every pad key j >= L_b > i
+is already excluded by j <= i, so SDPA(is_causal=True, attn_mask=None) gives the same attention.
+Pad query rows (i >= L_b) now also see pad keys L_b..i: their output differs, but U drops those rows
+(pack_rows after self_attn, unpad.py _layer_packed), so their dO is exactly 0 and their share of
+dQ / dK / dV is exactly 0 (dV += P^T dO = 0; dP = dO V^T = 0, D = rowsum(dO * O) = 0, dS = 0).
+No row is fully masked under causal (key 0 is always visible), so no NaN. The cutlass
+mem-efficient kernel then skips the key blocks above the diagonal (forward) and the query blocks
+below it (backward), and torch no longer turns the bool mask into a float bias per call (where /
+fill kernels). Real rows are expected equal up to fp16 ulp-level drift [not proven bit-exact].
+Only the exact mask object entered by U qualifies (identity / same storage, shape, stride); any
+other mask, a sliding window, or the flag off runs the v6.1 dense-mask call. GQA stays on
+repeat_kv (no enable_gqa: the sm75 mem-efficient path must not fall back to math).
 """
 
 import contextlib
@@ -62,9 +81,49 @@ import contextlib
 import torch
 
 USE_SDPA_RECOMPUTE = False  # read on every call; solution.apply() sets it
+USE_CAUSAL_PADDED = False  # v7 I1; read on every call; solution.apply() sets it
 
 _MARK = "_soup_delta_sdpa_recompute"
-COUNTS = {"recompute": 0, "original": 0}
+COUNTS = {"recompute": 0, "original": 0, "causal": 0}
+
+# v7 I1: the mask object U entered with causal_mask_scope(), else None.
+_CAUSAL_MASK = None
+
+
+@contextlib.contextmanager
+def causal_mask_scope(mask):
+    """While active, SDPA calls whose mask is exactly `mask` may run as is_causal=True (I1)."""
+    global _CAUSAL_MASK
+    previous = _CAUSAL_MASK
+    _CAUSAL_MASK = mask
+    try:
+        yield
+    finally:
+        _CAUSAL_MASK = previous
+
+
+def _same_mask(a, b):
+    if a is b:
+        return True
+    return (a.data_ptr() == b.data_ptr() and a.shape == b.shape and a.stride() == b.stride()
+            and a.dtype == b.dtype and a.device == b.device)
+
+
+def _causal_ok(query, attention_mask, kwargs):
+    """True when this (already A1-qualified) call may drop the mask for is_causal=True. Reads only."""
+    if not USE_CAUSAL_PADDED:
+        return False
+    scoped = _CAUSAL_MASK
+    if scoped is None or not isinstance(scoped, torch.Tensor):
+        return False
+    if kwargs.get("sliding_window") is not None:
+        return False
+    # q_len == kv_len is already guarded by _fast_n_rep; the scoped mask is [B, 1, T, T].
+    b, _, t, _ = query.shape
+    if tuple(attention_mask.shape) != (b, 1, t, t):
+        return False
+    return _same_mask(attention_mask, scoped)
+
 
 # Filled by patch_sdpa_recompute(): the genuine sdpa_attention_forward, repeat_kv, use_gqa_in_sdpa
 # and torch.nn.functional.scaled_dot_product_attention. Soup's tests may swap sys.modules["torch"]
@@ -130,17 +189,23 @@ def _private_saves():
             cm.__exit__(None, None, None)
 
 
-def _sdpa(q, k, v, mask, scale):
+def _sdpa(q, k, v, mask, scale, causal=False):
     # The call of sdpa_attention_forward (integrations/sdpa_attention.py:158-167) with a mask:
     # dropout 0 (guarded), is_causal False (:124), no enable_gqa (k, v already repeated).
+    # I1 (causal): no mask and is_causal=True, the call base itself makes when the mask is None
+    # (:124); top-left alignment equals bottom-right here because q_len == kv_len (guarded).
+    if causal:
+        return _REFS["sdpa"](q, k, v, attn_mask=None, dropout_p=0.0, scale=scale, is_causal=True)
     return _REFS["sdpa"](q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=False)
 
 
 class _SDPARecompute(torch.autograd.Function):
-    """SDPA(q, repeat_kv(k), repeat_kv(v), mask) in fp16 that saves fp16 q, k, v and the mask."""
+    """SDPA(q, repeat_kv(k), repeat_kv(v), mask) in fp16 that saves fp16 q, k, v and the mask.
+    With causal=True (I1) the mask is neither used nor saved."""
 
     @staticmethod
-    def forward(ctx, query, key, value, mask, n_rep, scale):
+    def forward(ctx, query, key, value, mask, n_rep, scale, causal=False):
+        causal = bool(causal)
         repeat_kv = _REFS["repeat_kv"]
         f16 = torch.float16
         # .to() keeps the strides of query (a transposed view), as autocast's cast does.
@@ -156,10 +221,11 @@ class _SDPARecompute(torch.autograd.Function):
             q = q16.detach().requires_grad_(True)
             k = repeat_kv(k16, n_rep).detach().requires_grad_(True)
             v = repeat_kv(v16, n_rep).detach().requires_grad_(True)
-            res = _sdpa(q, k, v, mask, scale)
+            res = _sdpa(q, k, v, mask, scale, causal)
         out = res.detach()
         del res, q, k, v
-        ctx.save_for_backward(q16, k16, v16, mask)
+        ctx.save_for_backward(q16, k16, v16, None if causal else mask)
+        ctx.causal = causal
         ctx.n_rep = n_rep
         ctx.scale = scale
         ctx.in_dtypes = (query.dtype, key.dtype, value.dtype)
@@ -170,15 +236,17 @@ class _SDPARecompute(torch.autograd.Function):
     def backward(ctx, dout):
         need = ctx.needs_input_grad[:3]
         if dout is None or not any(need):
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
         q16, k16, v16, mask = ctx.saved_tensors
-        n_rep, scale = ctx.n_rep, ctx.scale
+        n_rep, scale, causal = ctx.n_rep, ctx.scale, ctx.causal
         repeat_kv = _REFS["repeat_kv"]
         with torch.enable_grad(), torch.autocast(q16.device.type, enabled=False), _private_saves():
             q = q16.detach().requires_grad_(need[0])
             k = repeat_kv(k16, n_rep).detach().requires_grad_(need[1])
             v = repeat_kv(v16, n_rep).detach().requires_grad_(need[2])
-            out = _sdpa(q, k, v, mask, scale)
+            out = _sdpa(q, k, v, mask, scale, causal)
+            if causal:
+                COUNTS["causal"] += 1
             leaves = [t for t, n in zip((q, k, v), need) if n]
             grads = list(torch.autograd.grad(out, leaves, dout))
         del out, q, k, v
@@ -196,7 +264,7 @@ class _SDPARecompute(torch.autograd.Function):
                 b, h_kv, t, d = (k16 if i == 1 else v16).shape
                 g = g.reshape(b, h_kv, n_rep, t, d).sum(2)
             result.append(g)
-        return result[0], result[1], result[2], None, None, None
+        return result[0], result[1], result[2], None, None, None, None
 
 
 def _fast_n_rep(module, query, key, value, attention_mask, args, kwargs):
@@ -256,8 +324,15 @@ def sdpa_forward(module, query, key, value, attention_mask, *args, **kwargs):
         except Exception:  # noqa: BLE001 - an unexpected object is never ours to handle
             n_rep = None
         if n_rep is not None:
-            out = _SDPARecompute.apply(query, key, value, attention_mask, n_rep, kwargs.get("scaling"))
+            try:  # I1: reads only; any surprise keeps the v6.1 dense-mask call
+                causal = _causal_ok(query, attention_mask, kwargs)
+            except Exception:  # noqa: BLE001
+                causal = False
+            out = _SDPARecompute.apply(query, key, value, attention_mask, n_rep,
+                                       kwargs.get("scaling"), causal)
             COUNTS["recompute"] += 1
+            if causal:
+                COUNTS["causal"] += 1
             # sdpa_attention_forward returns (attn_output.transpose(1, 2).contiguous(), None) (:168-170)
             return out.transpose(1, 2).contiguous(), None
     COUNTS["original"] += 1

@@ -40,6 +40,7 @@ import sys
 import warnings
 
 import torch
+import torch.nn.functional as F
 
 from . import mlp as _k4
 
@@ -55,6 +56,16 @@ SWIGLU_BACKWARD = "example"
 # otherwise, so the same compiled variant and the same bits; two [tokens, 8960] fp16 buffers fewer
 # at the moment of the MLP backward (see _swiglu_backward_inplace).
 INPLACE_SWIGLU_BACKWARD = True
+# v7 I2: dense gate/up weights in the backward. "off" (v6.1): gate_proj(x16) and up_proj(x16)
+# dequantize W_gate and W_up inside K1's SoupNF4Matmul.forward, then step 4 dequantizes both
+# again (4 [8960, 1536] dequants per layer). "both": dequantize each once, recompute g = x16 W_g^T
+# and u = x16 W_u^T from those dense weights and keep them for dx (2 dequants; +1 dense weight,
+# 26.25 MiB, alive at the recompute of u). "up": keep only W_up (3 dequants; no extra weight at
+# the recompute of u, +1 weight at step 4 only, where far fewer buffers are alive). Taken only
+# when K1 would have run the same F.linear (kernels/nf4.py k1_dense_path); otherwise the v6.1
+# code runs and REUSE_COUNTS["fallback"] counts it. apply() sets this (solution/__init__.py).
+S4_DEQUANT_REUSE = "off"
+REUSE_COUNTS = {"both": 0, "up": 0, "fallback": 0}
 
 _PATCH_MARK = "_soup_delta_mlp_recompute"
 _PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")
@@ -155,12 +166,108 @@ def _down_input_grad(grad_out, down_proj):
     return dh
 
 
+def _reuse_nf4(mode, x16, gate_proj, up_proj, g_saved):
+    """K1's module when the dequant-reuse path `mode` may replace the layer calls, else None.
+
+    The replaced call is gate_proj(x16) / up_proj(x16): Linear4bit.forward (bitsandbytes
+    nn/modules.py:609-637) with an fp16 compute dtype casts nothing, passes the Params4bit itself
+    and bias=None to bnb.matmul_4bit (:637), which is K1's soup_matmul_4bit while _active_nf4()
+    says so; when k1_dense_path holds, that is SoupNF4Matmul.apply -> F.linear(A,
+    nf4_dequantize(B, quant_state), None) (kernels/nf4.py SoupNF4Matmul.forward), and the
+    trailing .to(inp_dtype) is a no-op on fp16. Any doubt returns None (the v6.1 code runs).
+    """
+    if mode == "both" and g_saved is not None:
+        return None
+    nf4 = _active_nf4()
+    dense_path = getattr(nf4, "k1_dense_path", None)
+    if dense_path is None:
+        return None
+    try:
+        from bitsandbytes.nn import Linear4bit
+
+        for proj in ((gate_proj, up_proj) if mode == "both" else (up_proj,)):
+            # K4's guard already demands exactly this (mlp.py:38-42) and _reject_reason a missing
+            # bias and no hooks (:323-337); rechecked here because the fused block reaches this
+            # helper from its own backward. An instance-level forward (e.g. an accelerate hook)
+            # would be bypassed, so it keeps the layer call.
+            if type(proj) is not Linear4bit or "forward" in proj.__dict__:
+                return None
+            if getattr(proj, "compute_dtype", None) not in (None, torch.float16):
+                return None
+            if getattr(proj, "bias", None) is not None:
+                return None
+            weight = proj.weight
+            if not dense_path(x16, weight, weight.quant_state):
+                return None
+    except Exception:  # noqa: BLE001 - unexpected objects: the layer calls decide, as in v6.1
+        return None
+    return nf4
+
+
+def _swiglu_grads(dh, g, u, may_inplace):
+    if may_inplace and _inplace_ok(dh, g, u):
+        return _swiglu_backward_inplace(dh, g, u)
+    return _swiglu_backward(dh, g, u)
+
+
+def _gate_up_input_grad_both(nf4, dh_box, x16, gate_proj, up_proj):
+    """"both": steps 2-4 with each of W_gate, W_up dequantized once.
+
+    The same operations on the same operands as the v6.1 code, in the same order: F.linear(x16, W)
+    with bias None is what SoupNF4Matmul.forward runs inside gate_proj(x16); W is K1's dequant of
+    the same Params4bit (bit-identical to the view(-1, 1) form _dequantize_weight used); dx is
+    dg @ W_gate, then += du @ W_up. So g, u, dg, du and dx are bit-identical to "off".
+    """
+    dh = dh_box.pop()
+    w_gate_q, w_up_q = gate_proj.weight, up_proj.weight
+    with torch.autocast(x16.device.type, enabled=False):  # as in _gate_up_input_grad
+        w_gate = nf4.nf4_dequantize(w_gate_q, w_gate_q.quant_state)
+        g = F.linear(x16, w_gate)
+        w_up = nf4.nf4_dequantize(w_up_q, w_up_q.quant_state)
+        u = F.linear(x16, w_up)
+    dg, du = _swiglu_grads(dh, g, u, True)
+    del dh, g, u
+    dx = torch.matmul(dg, w_gate)
+    del w_gate, dg
+    dx.add_(torch.matmul(du, w_up))
+    del w_up, du
+    return dx
+
+
+def _gate_up_input_grad_up(nf4, dh_box, x16, gate_proj, up_proj, g_saved):
+    """"up": W_up dequantized once and kept for dx; gate exactly as in v6.1. Same bits."""
+    dh = dh_box.pop()
+    w_up_q = up_proj.weight
+    with torch.autocast(x16.device.type, enabled=False):
+        g = g_saved if g_saved is not None else gate_proj(x16)
+        w_up = nf4.nf4_dequantize(w_up_q, w_up_q.quant_state)
+        u = F.linear(x16, w_up)
+    dg, du = _swiglu_grads(dh, g, u, g_saved is None)
+    del dh, g, u
+    weight = _dequantize_weight(gate_proj, dg.dtype)
+    dx = torch.matmul(dg, weight)
+    del weight, dg
+    dx.add_(torch.matmul(du, w_up))
+    del w_up, du
+    return dx
+
+
 def _gate_up_input_grad(dh_box, x16, gate_proj, up_proj, g_saved=None):
     """Steps 2-4 of the S4 backward from dh: recompute g/u, SwiGLU backward, dx16.
 
     dh comes in a one-element list that is emptied here, so no caller frame keeps dh alive and
     its buffer (or, in place, its reuse as dgate) is the only one of its size.
     """
+    mode = S4_DEQUANT_REUSE
+    if mode == "both" or mode == "up":
+        nf4 = _reuse_nf4(mode, x16, gate_proj, up_proj, g_saved)
+        if nf4 is not None:
+            REUSE_COUNTS[mode] += 1
+            if mode == "both":
+                return _gate_up_input_grad_both(nf4, dh_box, x16, gate_proj, up_proj)
+            return _gate_up_input_grad_up(nf4, dh_box, x16, gate_proj, up_proj, g_saved)
+        REUSE_COUNTS["fallback"] += 1
+
     dh = dh_box.pop()
     # 2. Recompute through the layers. The forward ran with fp16 operands, where fp16 autocast
     #    casts nothing, so autocast is switched off here: if a caller ever runs backward inside
@@ -221,6 +328,12 @@ def _dequantize_weight(layer, dtype):
     (K1's tests and the Kaggle micro-benchmark check torch.equal) and keeps the dequant work in
     our kernel (check 4). K1 refuses non-nf4 / non-nested / non-fp16 states with TypeError or
     ValueError (`nf4.py:104-175`); bitsandbytes handles those.
+
+    v7 I2 (S4_DEQUANT_REUSE != "off"): K1 gets the Params4bit itself, as K1's forward does. K1
+    reads only its storage (same pointer, numel, contiguity: the same bits), but its validation
+    cache (`kernels/nf4.py` _checked_shape) keys on the packed object: a fresh view each call
+    missed it and evicted the forward's entry, so every forward and backward dequant of the
+    weight re-ran the full validation. bnb's fallback below keeps the view(-1, 1) form.
     """
     weight = layer.weight
     quant_state = weight.quant_state
@@ -228,7 +341,8 @@ def _dequantize_weight(layer, dtype):
     nf4 = _active_nf4()
     if nf4 is not None:
         try:
-            dense = nf4.nf4_dequantize(packed, quant_state)
+            dense = nf4.nf4_dequantize(weight if S4_DEQUANT_REUSE != "off" else packed,
+                                       quant_state)
         except (TypeError, ValueError):
             dense = None
         if dense is not None:

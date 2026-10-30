@@ -38,6 +38,7 @@ from transformers import Qwen2Config, Qwen2ForCausalLM  # noqa: E402
 from transformers.models.qwen2 import modeling_qwen2 as mq  # noqa: E402
 
 import solution.fused_block as fb  # noqa: E402
+import solution.kernels.nf4 as nf4  # noqa: E402
 import solution.lora_replay as a2  # noqa: E402
 import solution.saved_compact as sc  # noqa: E402
 import solution.sdpa_recompute as a1  # noqa: E402
@@ -152,7 +153,8 @@ def _build_fp16_nf4(layers=2, vocab=1024):
     return pm
 
 
-def test_training_steps_hold_flat_memory(v6_patches, monkeypatch):
+@pytest.mark.parametrize("causal", [False, True], ids=["v61", "i1_causal"])
+def test_training_steps_hold_flat_memory(v6_patches, monkeypatch, causal):
     patched_forward = v6_patches
     calls = []
     real_fused = fb.add_norm_mlp
@@ -162,7 +164,7 @@ def test_training_steps_hold_flat_memory(v6_patches, monkeypatch):
         return real_fused(*a, **k)
 
     monkeypatch.setattr(fb, "add_norm_mlp", counting)
-    tm._set(True)  # B + A1 + A2 + D on, A off: what solution.apply() switches on
+    tm._set(True, causal=causal)  # B + A1 + A2 + D (+ v7 I1) on, A off: what apply() switches on
     pm = _build_fp16_nf4()
     n_layers = pm.config.num_hidden_layers
     params = [p for p in pm.parameters() if p.requires_grad]
@@ -199,6 +201,8 @@ def test_training_steps_hold_flat_memory(v6_patches, monkeypatch):
     assert len(calls) == n_layers * STEPS  # B
     assert a1.COUNTS["recompute"] - c1["recompute"] == n_layers * STEPS  # A1
     assert a1.COUNTS["original"] - c1["original"] == 0
+    # v7 I1: every layer forward and every recompute in backward took is_causal=True.
+    assert a1.COUNTS["causal"] - c1.get("causal", 0) == (2 * n_layers * STEPS if causal else 0)
     assert a2.COUNTS["replay"] - c2["replay"] >= 2 * (n_layers - 1) * STEPS  # A2
     assert sc.COUNTS["rows_packed"] - c3["rows_packed"] == 2 * n_layers * STEPS  # D
 
@@ -209,3 +213,125 @@ def test_training_steps_hold_flat_memory(v6_patches, monkeypatch):
     assert all(abs(a - after[1]) <= MiB for a in after[1:]), mib
     # The peak of a step does not grow (same shapes every step).
     assert all(p <= peaks[1] + MiB for p in peaks[2:]), peak_mib
+
+
+# ---------------------------------------------------------------------------------------------
+# v7 I3 on the same stack: no re-validation after step 1, k/v dense cache
+# ---------------------------------------------------------------------------------------------
+
+def _i3_flags(monkeypatch, fast, dense):
+    monkeypatch.setattr(nf4, "USE_K1_FAST_HOST", fast)
+    monkeypatch.setattr(nf4, "USE_DENSE_CACHE", dense)
+    monkeypatch.setattr(nf4, "DENSE_CACHE_QO", False)
+    monkeypatch.setattr(nf4, "DENSE_CACHE_MIB", 64)
+
+
+def _counter(monkeypatch, name):
+    calls = []
+    real = getattr(nf4, name)
+
+    def counting(*a, **k):
+        calls.append(1)
+        return real(*a, **k)
+
+    monkeypatch.setattr(nf4, name, counting)
+    return calls
+
+
+def _train_step(pm, batch, params, opt):
+    extra = {"num_items_in_batch": tu.num_items(batch)}
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = pm(**batch, use_cache=False, **extra)
+    (out.loss * tu.LOSS_SCALE).backward()
+    del out
+    with torch.no_grad():
+        for p in params:
+            p.grad.div_(tu.LOSS_SCALE)
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+
+
+def test_i3_no_revalidation_and_kv_cache_in_training(v6_patches, monkeypatch):
+    """Every v6 patch on (D included), I3 on. (a) _validate_inputs runs only in step 1 (7 NF4
+    weights per layer, once each), never again; with USE_K1_FAST_HOST off it runs in every step
+    (the v6.1 cost I3 removes: D's detach aliases and S4's views missed the cache and evicted the
+    weight's own record). (c) the dense cache holds exactly k and v of every layer, and memory
+    stays flat from step 2 to step 6. (d) per step the dequant kernel launches 4 times fewer per
+    layer than with the cache off (k, v forward + backward; layer 0 has no backward)."""
+    patched_forward = v6_patches
+    _i3_flags(monkeypatch, fast=True, dense=True)
+    nf4.dense_cache_clear()
+    validations = _counter(monkeypatch, "_validate_inputs")
+    launches = _counter(monkeypatch, "_launch_here")
+    tm._set(True)
+    pm = _build_fp16_nf4()
+    n_layers = pm.config.num_hidden_layers
+    params = [p for p in pm.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=1e-4)
+    batches = [tu.make_batch(pm.config.vocab_size, seed=s) for s in (1, 2)]
+    mq.Qwen2Model.forward = patched_forward
+    kv_bytes = 2 * n_layers * 256 * 1536 * 2  # k_proj + v_proj, fp16
+    try:
+        per_val, per_launch, after, dense = [], [], [], []
+        for step in range(6):
+            v0, l0 = len(validations), len(launches)
+            _train_step(pm, batches[step % 2], params, opt)
+            per_val.append(len(validations) - v0)
+            per_launch.append(len(launches) - l0)
+            after.append(_allocated())
+            dense.append((len(nf4._DENSE), nf4._DENSE_BYTES[0]))
+        assert sc.COUNTS["rows_packed"] > 0  # D really ran (its aliases are what (a) is about)
+        assert per_val[0] == 7 * n_layers, per_val  # (a)
+        assert per_val[1:] == [0] * 5, per_val
+        assert all(d == (2 * n_layers, kv_bytes) for d in dense), dense  # (c)
+        # Flat within less than one cached k/v weight (0.75 MiB).
+        assert all(abs(a - after[1]) <= MiB // 2 for a in after[1:]), [a / MiB for a in after]
+        assert len(set(per_launch[1:])) == 1, per_launch
+
+        # (d) the same steps with the cache off: 4 more launches per layer, minus layer 0's two
+        # backward ones; no re-validation either.
+        monkeypatch.setattr(nf4, "USE_DENSE_CACHE", False)
+        v0, l0 = len(validations), len(launches)
+        _train_step(pm, batches[0], params, opt)
+        assert len(validations) == v0
+        assert (len(launches) - l0) - per_launch[1] == 4 * n_layers - 2, (per_launch, len(launches) - l0)
+
+        # The v6.1 behaviour, for the record: re-validation in every step.
+        monkeypatch.setattr(nf4, "USE_K1_FAST_HOST", False)
+        for _ in range(2):
+            v0 = len(validations)
+            _train_step(pm, batches[0], params, opt)
+            assert len(validations) > v0
+    finally:
+        nf4.dense_cache_clear()
+
+
+def test_i3_kv_cache_same_numbers(v6_patches, monkeypatch):
+    """(c) cache off vs on (miss step, then hit step): the same loss, hidden states, RNG stream and
+    LoRA gradients; bit for bit where the cache-off run is itself reproducible (A1's SDPA backward
+    may not be, test_v6_merged)."""
+    patched = v6_patches
+    tm._set(True)
+    pm = _build_fp16_nf4()
+    batch = tu.make_batch(pm.config.vocab_size)
+    extra = {"num_items_in_batch": tu.num_items(batch)}
+    nf4.dense_cache_clear()
+    try:
+        _i3_flags(monkeypatch, fast=True, dense=False)
+        ref_a = tm._run(pm, batch, patched, extra)
+        ref_b = tm._run(pm, batch, patched, extra)
+        _i3_flags(monkeypatch, fast=True, dense=True)
+        miss = tm._run(pm, batch, patched, extra)
+        assert len(nf4._DENSE) == 2 * pm.config.num_hidden_layers
+        hit = tm._run(pm, batch, patched, extra)
+        for new in (miss, hit):
+            assert torch.equal(new["rng_fwd"], ref_a["rng_fwd"])
+            assert torch.equal(new["rng_bwd"], ref_a["rng_bwd"])
+            tp._assert_matches(ref_a["loss"], ref_b["loss"], new["loss"], "loss")
+            tp._assert_matches(ref_a["hidden"], ref_b["hidden"], new["hidden"], "hidden")
+            assert new["grads"].keys() == ref_a["grads"].keys()
+            for name in ref_a["grads"]:
+                tp._assert_matches(ref_a["grads"][name], ref_b["grads"][name], new["grads"][name],
+                                   name)
+    finally:
+        nf4.dense_cache_clear()

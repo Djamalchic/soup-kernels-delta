@@ -182,6 +182,7 @@ def s4(monkeypatch):
     nf4.patch_bnb_matmul_4bit()
     monkeypatch.setattr(rc, "USE_MLP_RECOMPUTE", True)
     monkeypatch.setattr(rc, "RECOMPUTE_GATE", True)
+    monkeypatch.setattr(rc, "S4_DEQUANT_REUSE", "off")  # v6.1 unless a test says otherwise
     monkeypatch.setattr(rc, "SWIGLU_BACKWARD", "example")
     rc.patch_qwen2_mlp_recompute()
     assert rc._swiglu_example_kernel is not None
@@ -277,6 +278,93 @@ def test_fused_block_bit_exact_and_saves_less(s4, monkeypatch, rows, r_grad):
     # v5 keeps r_mid (fp32) + x16 (fp16); B keeps a (fp16) only (r is the caller's tensor).
     expect = rows * H * (4 + 2 - 2)
     assert h0 - h1 >= 0.9 * expect, (h0, h1, expect)
+
+
+# ---------------------------------------------------------------------------------------------
+# v7 I2: dequant reuse in the S4 backward (S4_DEQUANT_REUSE), through B and alone
+# ---------------------------------------------------------------------------------------------
+
+def _k1_dense(mlp, rows):
+    probe = torch.empty(rows, H, device="cuda", dtype=torch.float16)
+    w = mlp.up_proj.weight
+    return nf4.k1_dense_path(probe, w, w.quant_state)
+
+
+@pytest.mark.parametrize("rows", [300, 1350, 2000])
+def test_fused_block_dequant_reuse_bit_exact(s4, monkeypatch, rows):
+    """B with "both" against v5's ops with "off": same output, same dr and da, bit for bit."""
+    monkeypatch.setattr(fb, "USE_FUSED_BLOCK", True)
+    layer = _Layer()
+    dense = _k1_dense(layer.mlp, rows)
+    assert dense or rows <= 1536
+    torch.manual_seed(7)
+    r0 = 2.0 * torch.randn(rows, H, device="cuda")
+    a0 = torch.randn(rows, H, device="cuda", dtype=torch.float16)
+    g = torch.randn(rows, H, device="cuda")
+    out = {}
+    for fused, mode in ((False, "off"), (True, "off"), (True, "both"), (False, "both")):
+        monkeypatch.setattr(rc, "S4_DEQUANT_REUSE", mode)
+        r = r0.clone().requires_grad_(True)
+        a = a0.clone().requires_grad_(True)
+        before = dict(rc.REUSE_COUNTS)
+        with torch.autocast("cuda", dtype=torch.float16):
+            if fused:
+                assert fb.fused_ok(layer, r, a, mq.Qwen2MLP, mq.Qwen2RMSNorm)
+                nxt = fb.add_norm_mlp(r, a, layer)
+            else:
+                nxt = _v5_ops(layer, r, a)
+        nxt.backward(g)
+        delta = {k: rc.REUSE_COUNTS[k] - before[k] for k in before}
+        if mode == "both":
+            assert delta == {"both": int(dense), "up": 0, "fallback": int(not dense)}, delta
+        out[(fused, mode)] = (nxt.detach(), r.grad, a.grad)
+    ref = out[(False, "off")]
+    for key, got in out.items():
+        for new, old in zip(got, ref):
+            assert torch.equal(new, old), key
+
+
+def test_dequant_reuse_peak_and_dequant_count(s4, monkeypatch):
+    """At 2000 rows (K1's dense path for sure, ops.py:954-955), per MLP backward: "both" adds at
+    most one dense weight W to the peak (it is held while u is recomputed) and launches 2 fewer
+    big dequants; "up" adds nothing here (U > W) and launches 1 fewer."""
+    mlp = _mlp()
+    rows = 2000
+    assert _k1_dense(mlp, rows)
+    x = torch.randn(rows, H, device="cuda")
+    grad = torch.randn(rows, H, device="cuda")
+    real = nf4.nf4_dequantize
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(nf4, "nf4_dequantize", counting)
+    results = {}
+    for mode in ("off", "both", "up", "off", "both", "up"):  # first pass: warm-up
+        monkeypatch.setattr(rc, "S4_DEQUANT_REUSE", mode)
+        xi = x.clone().requires_grad_(True)
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = mlp(xi)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        calls.clear()
+        out.backward(grad)
+        torch.cuda.synchronize()
+        results[mode] = (out.detach(), xi.grad, torch.cuda.max_memory_allocated() - base,
+                         len(calls))
+        del out, xi
+    (o0, g0, p0, c0) = results["off"]
+    w_bytes, u_bytes = 8960 * H * 2, rows * 8960 * 2
+    assert u_bytes > w_bytes
+    for mode, extra_w, fewer in (("both", 1, 2), ("up", 0, 1)):
+        o, g_, p, c = results[mode]
+        assert torch.equal(o, o0) and torch.equal(g_, g0), mode
+        assert c == c0 - fewer, (mode, c0, c)  # off: down 1 + gate/up recompute 2 + dx 2 = 5
+        assert p - p0 <= extra_w * w_bytes + MiB, (mode, p0 / MiB, p / MiB)
+    assert c0 == 5
 
 
 def test_fused_ok_guards(s4, monkeypatch):

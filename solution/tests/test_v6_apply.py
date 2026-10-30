@@ -42,14 +42,22 @@ def recorder(monkeypatch):
     monkeypatch.setattr(sdpa_recompute, "patch_sdpa_recompute", rec("a1", lambda: result["a1"]))
     monkeypatch.setattr(saved_compact, "patch_sdpa_kv_compact", rec("a", lambda: result["a"]))
     monkeypatch.setattr(lora_replay, "patch_lora_dropout_replay", rec("a2"))
-    for mod, flag in ((mlp_recompute, "USE_MLP_RECOMPUTE"), (unpad, "USE_UNPAD"),
+    for mod, flag in ((mlp_recompute, "USE_MLP_RECOMPUTE"), (mlp_recompute, "S4_DEQUANT_REUSE"),
+                      (unpad, "USE_UNPAD"), (unpad, "S4_OFF_FRACTION"),
                       (fused_block, "USE_FUSED_BLOCK"), (saved_compact, "USE_LORA_ROW_COMPACT"),
                       (saved_compact, "USE_SDPA_KV_COMPACT"), (sdpa_recompute, "USE_SDPA_RECOMPUTE"),
+                      (sdpa_recompute, "USE_CAUSAL_PADDED"),
                       (lora_replay, "USE_LORA_DROPOUT_REPLAY"), (head_loss, "STORE_HEAD_FP16")):
         monkeypatch.setattr(mod, flag, getattr(mod, flag))
+    from solution.kernels import nf4  # v7 I3: apply() writes these too
+
+    for flag in ("USE_K1_FAST_HOST", "USE_DENSE_CACHE", "DENSE_CACHE_QO", "DENSE_CACHE_MIB"):
+        monkeypatch.setattr(nf4, flag, getattr(nf4, flag))
     for flag in ("USE_ADDNORM", "USE_UNPAD", "USE_MLP_RECOMPUTE", "USE_HEAD_CE", "USE_FUSED_BLOCK",
-                 "USE_SDPA_RECOMPUTE", "USE_LORA_DROPOUT_REPLAY", "USE_LORA_ROW_COMPACT",
-                 "USE_SDPA_KV_COMPACT", "STORE_HEAD_FP16"):
+                 "USE_SDPA_RECOMPUTE", "USE_SDPA_CAUSAL_PADDED", "USE_LORA_DROPOUT_REPLAY",
+                 "USE_LORA_ROW_COMPACT", "USE_SDPA_KV_COMPACT", "STORE_HEAD_FP16", "S4_DEQUANT_REUSE",
+                 "S4_OFF_FRACTION", "USE_K1_FAST_HOST", "USE_DENSE_CACHE", "DENSE_CACHE_QO",
+                 "DENSE_CACHE_MIB"):
         monkeypatch.setattr(solution, flag, getattr(solution, flag))
     return calls, result
 
@@ -73,6 +81,7 @@ def test_default_apply_installs_a1_and_never_a(recorder):
     assert fused_block.USE_FUSED_BLOCK is True
     assert lora_replay.USE_LORA_DROPOUT_REPLAY is True and "a2" in calls
     assert head_loss.STORE_HEAD_FP16 is False
+    assert mlp_recompute.S4_DEQUANT_REUSE == "both"  # v7 I2
     assert calls.index("u") < calls.index("a1")  # U (and with it A / D's scope) before attention patches
 
 
@@ -133,3 +142,26 @@ def test_head_flag_is_forwarded(recorder, monkeypatch):
     monkeypatch.setattr(solution, "STORE_HEAD_FP16", True)
     solution.apply()
     assert head_loss.STORE_HEAD_FP16 is True
+
+
+# v7 I1: causal-only SDPA on U's packed path, wired as A1 + U + its own flag.
+
+def test_i1_default_is_on_with_a1_and_u(recorder):
+    assert solution.USE_SDPA_CAUSAL_PADDED is True
+    solution.apply()
+    assert sdpa_recompute.USE_CAUSAL_PADDED is True
+
+
+@pytest.mark.parametrize("case", ["a1_refused", "a1_off", "u_off", "flag_off"])
+def test_i1_off_without_its_prerequisites(recorder, monkeypatch, case):
+    _, result = recorder
+    if case == "a1_refused":
+        result["a1"] = False
+    elif case == "a1_off":
+        monkeypatch.setattr(solution, "USE_SDPA_RECOMPUTE", False)
+    elif case == "u_off":
+        monkeypatch.setattr(solution, "USE_UNPAD", False)
+    else:
+        monkeypatch.setattr(solution, "USE_SDPA_CAUSAL_PADDED", False)
+    solution.apply()
+    assert sdpa_recompute.USE_CAUSAL_PADDED is False

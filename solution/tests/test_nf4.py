@@ -435,3 +435,208 @@ def test_single_soup_kernel_far_from_example(monkeypatch):
     finally:
         if not had_common:
             sys.modules.pop("common", None)
+
+
+# --- v7 I3: alias-aware validation cache, same-device launch, k/v dense cache ---------------
+
+import copy  # noqa: E402
+import gc  # noqa: E402
+
+
+@pytest.fixture
+def i3(monkeypatch):
+    """I3 switches on (monkeypatch restores them), an empty dense cache before and after."""
+    monkeypatch.setattr(nf4, "USE_K1_FAST_HOST", True)
+    monkeypatch.setattr(nf4, "USE_DENSE_CACHE", True)
+    monkeypatch.setattr(nf4, "DENSE_CACHE_QO", False)
+    monkeypatch.setattr(nf4, "DENSE_CACHE_MIB", 64)
+    nf4.dense_cache_clear()
+    yield monkeypatch
+    nf4.dense_cache_clear()
+
+
+def _count_validations(monkeypatch):
+    calls = []
+    real = nf4._validate_inputs
+
+    def counting(packed, quant_state):
+        calls.append(1)
+        return real(packed, quant_state)
+
+    monkeypatch.setattr(nf4, "_validate_inputs", counting)
+    return calls
+
+
+def _count_launches(monkeypatch):
+    calls = []
+    real = nf4._launch_here
+
+    def counting(*args):
+        calls.append(1)
+        return real(*args)
+
+    monkeypatch.setattr(nf4, "_launch_here", counting)
+    return calls
+
+
+@pytest.mark.parametrize("fast", (False, True))
+def test_i3_aliases_hit_the_validation_cache(quantized_weights, monkeypatch, fast):
+    """D hands SoupNF4Matmul.backward a `t.detach()` alias (saved_compact.py:126) and S4 a
+    `weight.view(-1, 1)` (mlp_recompute.py:226). v6.1 (fast=False) re-validated every alias AND
+    then the real weight (the alias evicted its record); I3 validates once."""
+    monkeypatch.setattr(nf4, "USE_K1_FAST_HOST", fast)
+    monkeypatch.setattr(nf4, "USE_DENSE_CACHE", False)
+    packed, state = quantized_weights[(1536, 1536)]  # never in the dense cache anyway
+    qs = copy.copy(state)  # own id: a fresh record
+    expected = bnb.functional.dequantize_4bit(packed, quant_state=state)
+    calls = _count_validations(monkeypatch)
+
+    assert_bit_exact(nf4.nf4_dequantize(packed, qs), expected)
+    assert len(calls) == 1
+    for _ in range(3):
+        assert_bit_exact(nf4.nf4_dequantize(packed.detach(), qs), expected)
+        assert_bit_exact(nf4.nf4_dequantize(packed.view(-1, 1), qs), expected)
+        assert_bit_exact(nf4.nf4_dequantize(packed, qs), expected)
+    if fast:
+        assert len(calls) == 1
+        assert nf4._VALID[id(qs)][1]() is packed  # the owner keeps its record
+    else:
+        assert len(calls) == 1 + 3 * 3  # alias, alias, then the evicted owner
+
+
+def test_i3_other_storage_still_revalidates(quantized_weights, i3):
+    packed, state = quantized_weights[(1536, 1536)]
+    qs = copy.copy(state)
+    expected = bnb.functional.dequantize_4bit(packed, quant_state=state)
+    calls = _count_validations(i3)
+    assert_bit_exact(nf4.nf4_dequantize(packed, qs), expected)
+    assert len(calls) == 1
+
+    other = packed.clone()  # same quant_state, same bytes, different data_ptr
+    assert other.data_ptr() != packed.data_ptr()
+    for i in range(3):
+        assert_bit_exact(nf4.nf4_dequantize(other, qs), expected)
+        assert len(calls) == 2 + i  # validated every time, never trusted by pointer
+    assert nf4._VALID[id(qs)][1]() is packed  # and the live owner was not evicted
+    assert_bit_exact(nf4.nf4_dequantize(packed, qs), expected)
+    assert len(calls) == 4
+
+    # Same start address, fewer bytes: not an alias.
+    with pytest.raises(ValueError, match="packed size"):
+        nf4.nf4_dequantize(packed.view(-1)[:-2], qs)
+    # Same bytes, another dtype: not an alias.
+    with pytest.raises(TypeError, match="uint8"):
+        nf4.nf4_dequantize(packed.view(torch.int8), qs)
+
+
+def test_i3_launch_skips_same_device_context(quantized_weights, i3):
+    packed, state = quantized_weights[(256, 1536)]
+    expected = bnb.functional.dequantize_4bit(packed, quant_state=state)
+    i3.setattr(nf4, "USE_DENSE_CACHE", False)
+    entered = []
+    real_device = torch.cuda.device
+
+    class Spy(real_device):
+        def __enter__(self):
+            entered.append(1)
+            return super().__enter__()
+
+    i3.setattr(torch.cuda, "device", Spy)
+    assert_bit_exact(nf4.nf4_dequantize(packed, state), expected)
+    assert entered == []
+    i3.setattr(nf4, "USE_K1_FAST_HOST", False)
+    assert_bit_exact(nf4.nf4_dequantize(packed, state), expected)
+    assert entered == [1]  # the v6.1 path
+
+
+def test_i3_dense_cache_kv_only(quantized_weights, i3):
+    packed, state = quantized_weights[(256, 1536)]
+    qs = copy.copy(state)
+    expected = bnb.functional.dequantize_4bit(packed, quant_state=state)
+    launches = _count_launches(i3)
+    nbytes = 256 * 1536 * 2
+
+    first = nf4.nf4_dequantize(packed, qs)
+    assert_bit_exact(first, expected)
+    assert len(launches) == 1 and nf4._DENSE_BYTES[0] == nbytes
+    assert nf4.nf4_dequantize(packed, qs) is first  # hit: no launch
+    assert nf4.nf4_dequantize(packed.detach(), qs) is first  # D's alias hits too
+    assert nf4.nf4_dequantize(packed.view(-1, 1), qs) is first  # S4's view
+    assert len(launches) == 1
+    assert_bit_exact(first, expected)  # nobody wrote into it
+
+    # out= is never served from (or stored in) the cache.
+    out = torch.empty((256, 1536), device="cuda", dtype=torch.float16)
+    assert nf4.nf4_dequantize(packed, qs, out=out) is out
+    assert len(launches) == 2 and nf4._DENSE_BYTES[0] == nbytes
+
+    # Other storage under the same quant_state: launched, not cached, entry kept.
+    other = packed.clone()
+    result = nf4.nf4_dequantize(other, qs)
+    assert result is not first and len(launches) == 3
+    assert_bit_exact(result, expected)
+    assert nf4.nf4_dequantize(packed, qs) is first
+
+    # A new metadata object -> a new record -> the stale entry is dropped and rebuilt.
+    qs.absmax = qs.absmax.clone()
+    rebuilt = nf4.nf4_dequantize(packed, qs)
+    assert rebuilt is not first and len(launches) == 4
+    assert_bit_exact(rebuilt, expected)
+    assert nf4._DENSE_BYTES[0] == nbytes and len(nf4._DENSE) == 1
+
+    # q/o shape: off by default, on with DENSE_CACHE_QO.
+    sq_packed, sq_state = quantized_weights[(1536, 1536)]
+    sq = copy.copy(sq_state)
+    a = nf4.nf4_dequantize(sq_packed, sq)
+    assert nf4.nf4_dequantize(sq_packed, sq) is not a
+    i3.setattr(nf4, "DENSE_CACHE_QO", True)
+    a = nf4.nf4_dequantize(sq_packed, sq)
+    assert nf4.nf4_dequantize(sq_packed, sq) is a
+    assert nf4._DENSE_BYTES[0] == nbytes + 1536 * 1536 * 2
+
+    # An entry dies with its quant_state; the byte counter follows.
+    del sq, a
+    gc.collect()
+    assert nf4._DENSE_BYTES[0] == nbytes and len(nf4._DENSE) == 1
+    del qs, first, rebuilt
+    gc.collect()
+    assert nf4._DENSE_BYTES[0] == 0 and not nf4._DENSE
+
+
+def test_i3_dense_cache_cap_and_inference_mode(quantized_weights, i3):
+    packed, state = quantized_weights[(256, 1536)]
+    qs = copy.copy(state)
+    i3.setattr(nf4, "DENSE_CACHE_MIB", 0)
+    a = nf4.nf4_dequantize(packed, qs)
+    assert nf4.nf4_dequantize(packed, qs) is not a and not nf4._DENSE
+    i3.setattr(nf4, "DENSE_CACHE_MIB", 64)
+    with torch.inference_mode():
+        nf4.nf4_dequantize(packed, qs)
+    assert not nf4._DENSE  # an inference tensor is never kept for training
+
+
+def test_i3_matmul_cache_on_equals_off(quantized_weights, i3):
+    """SoupNF4Matmul forward + backward on the k/v shape, cache off vs on (miss, then hit): the
+    same output, input gradient and bias gradient, bit for bit."""
+    packed, state = quantized_weights[(256, 1536)]
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    A0 = torch.randn((4, 150, 1536), device="cuda", dtype=torch.float16, generator=gen)
+    b0 = torch.randn((256,), device="cuda", dtype=torch.float16, generator=gen)
+    g = torch.randn((4, 150, 256), device="cuda", dtype=torch.float16, generator=gen)
+
+    def run():
+        A = A0.clone().requires_grad_(True)
+        b = b0.clone().requires_grad_(True)
+        out = nf4.SoupNF4Matmul.apply(A, packed, state, b)
+        out.backward(g)
+        return out.detach(), A.grad, b.grad
+
+    i3.setattr(nf4, "USE_DENSE_CACHE", False)
+    ref = run()
+    i3.setattr(nf4, "USE_DENSE_CACHE", True)
+    launches = _count_launches(i3)
+    miss = run()
+    hit = run()
+    assert len(launches) == 1  # the first run's forward only
+    for r, m, h in zip(ref, miss, hit):
+        assert torch.equal(r, m) and torch.equal(r, h)
