@@ -11,11 +11,10 @@ import triton
 import triton.language as tl
 
 
-# BLOCK counts packed bytes: 1024 bytes -> 2048 fp16 outputs.
-# Four warps nominally handle eight bytes / sixteen outputs per thread.
-# Each CTA covers 32 NF4 blocks, all within one 256-block nested-scale group.
-# This halves the CTA count of the previous 1024-output configuration.
-# It is a fixed, unbenchmarked T4 configuration, not an autotuned result.
+# One launch configuration. Four warps process eight output elements per
+# thread: enough contiguous work to amortize metadata loads while keeping
+# register pressure modest on T4. This is a bandwidth-oriented starting point,
+# not an empirically tuned configuration.
 _BLOCK = 1024
 _NUM_WARPS = 4
 
@@ -40,12 +39,6 @@ _NF4_VALUES = (
 
 _ORIGINAL_BNB_MATMUL_4BIT = None
 
-# Bounded, insertion-ordered cache. Strong quant_state references prevent
-# id reuse while an entry exists. No decoded values or packed tensors are
-# retained. In-place changes to tensor contents are read by every launch.
-_VALIDATION_CACHE = {}
-_VALIDATION_CACHE_LIMIT = 512
-
 
 @triton.jit(do_not_specialize=["n_elements"])
 def soup_nf4_dequant_kernel(
@@ -59,78 +52,26 @@ def soup_nf4_dequant_kernel(
     n_elements,
     BLOCK: tl.constexpr,
 ):
-    tl.static_assert(BLOCK >= 32)
-    tl.static_assert(BLOCK % 32 == 0)
-    tl.static_assert(8192 % BLOCK == 0)
+    e = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = e < n_elements
 
-    tile = tl.program_id(0)
-    byte_index = tile * BLOCK + tl.arange(0, BLOCK)
-    byte_valid = byte_index < tl.cdiv(n_elements, 2)
+    byte = tl.load(Packed + e // 2, mask=valid, other=0).to(tl.int32)
+    nibble = tl.where((e & 1) == 0, byte >> 4, byte & 15)
 
-    # Credit: the user's packed-byte, paired-store, and grouped-scale ideas.
-    # Streaming packed bytes bypass L1, leaving room for the small codebooks.
-    byte = tl.load(
-        Packed + byte_index,
-        mask=byte_valid,
-        other=0,
-        cache_modifier=".cg",
-    ).to(tl.int32)
-    byte = tl.reshape(byte, (BLOCK // 32, 32))
-    byte_valid = tl.reshape(byte_valid, (BLOCK // 32, 32))
-
-    first_group = tile * (BLOCK // 32)
-    group = first_group + tl.arange(0, BLOCK // 32)
-    group_valid = group < tl.cdiv(n_elements, 64)
-
-    abs_code = tl.load(
-        Abs8 + group,
-        mask=group_valid,
-        other=0,
-        cache_modifier=".ca",
-    ).to(tl.int32)
-    code = tl.load(
-        Code2 + abs_code,
-        mask=group_valid,
-        other=0,
-        cache_modifier=".ca",
-    )
-
-    # BLOCK divides 8192 packed bytes, so this CTA cannot cross an Abs2 group.
-    scale = tl.load(
-        Abs2 + first_group // 256,
-        mask=first_group * 64 < n_elements,
-        other=0,
-        cache_modifier=".ca",
-    )
+    block = e // 64
+    abs_code = tl.load(Abs8 + block, mask=valid, other=0).to(tl.int32)
+    code = tl.load(Code2 + abs_code, mask=valid, other=0)
+    scale = tl.load(Abs2 + block // 256, mask=valid, other=0)
     offset = tl.load(Offset)
 
-    # Two separate fp32 roundings; every launcher disables FP fusion.
+    # Both operations are fp32. The launcher MUST disable FP fusion so the
+    # multiplication rounds before the addition.
     scaled_code = code * scale
     absmax = scaled_code + offset
 
-    hi = tl.load(
-        Lut + (byte >> 4),
-        mask=byte_valid,
-        other=0,
-        cache_modifier=".ca",
-    )
-    lo = tl.load(
-        Lut + (byte & 15),
-        mask=byte_valid,
-        other=0,
-        cache_modifier=".ca",
-    )
-    hi = (hi * absmax[:, None]).to(
-        tl.float16, fp_downcast_rounding="rtne"
-    )
-    lo = (lo * absmax[:, None]).to(
-        tl.float16, fp_downcast_rounding="rtne"
-    )
-
-    # join appends a two-element dimension: high nibble, then low nibble.
-    result = tl.reshape(tl.join(hi, lo), (2 * BLOCK,))
-    element = tile * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
-    tl.store(Output + element, result, mask=element < n_elements)
+    value = tl.load(Lut + nibble, mask=valid, other=0)
+    result = (value * absmax).to(tl.float16, fp_downcast_rounding="rtne")
+    tl.store(Output + e, result, mask=valid)
 
 
 @lru_cache(maxsize=None)
@@ -177,7 +118,8 @@ def _validate_inputs(packed, quant_state):
     if not getattr(quant_state, "nested", False):
         raise ValueError("quant_state must use nested/double quantization")
 
-    # A bf16 reference would introduce different intermediate rounding.
+    # Restrict the reference dtype to fp16. In particular, a bf16 reference
+    # would introduce a different intermediate rounding before conversion.
     if getattr(quant_state, "dtype", None) != torch.float16:
         raise TypeError("quant_state.dtype must be torch.float16")
 
@@ -233,103 +175,19 @@ def _validate_inputs(packed, quant_state):
     return n, k
 
 
-def _tensor_stamp(tensor):
-    if not isinstance(tensor, torch.Tensor):
-        return None
-    # Shape covers numel and rank; contiguity covers the layout guard.
-    # data_ptr includes storage_offset. Unlike _version alone, these checks
-    # also detect relevant changes made through tensor.data assignments.
-    return (
-        tensor.data_ptr(),
-        tensor.dtype,
-        tensor.device,
-        tensor.shape,
-        tensor.is_contiguous(),
-    )
-
-
-def _validation_stamp(packed, quant_state):
-    shape = getattr(quant_state, "shape", None)
-    if not isinstance(shape, (tuple, list, torch.Size)):
-        return None
-
-    # Snapshot mutable lists and distinguish bool/float dimensions from ints.
-    shape_stamp = (
-        type(shape),
-        tuple((type(d), d) for d in shape),
-    )
-    state2 = getattr(quant_state, "state2", None)
-    return (
-        getattr(quant_state, "quant_type", None),
-        getattr(quant_state, "blocksize", None),
-        bool(getattr(quant_state, "nested", False)),
-        getattr(quant_state, "dtype", None),
-        shape_stamp,
-        getattr(state2, "blocksize", None),
-        _tensor_stamp(packed),
-        _tensor_stamp(getattr(quant_state, "absmax", None)),
-        _tensor_stamp(getattr(state2, "absmax", None)),
-        _tensor_stamp(getattr(state2, "code", None)),
-        _tensor_stamp(getattr(quant_state, "offset", None)),
-    )
-
-
-def _cached_validate_inputs(packed, quant_state):
-    key = id(quant_state)
-    entry = _VALIDATION_CACHE.get(key)
-    stamp = None
-
-    if entry is not None and entry[0] is quant_state:
-        try:
-            stamp = _validation_stamp(packed, quant_state)
-            if stamp is not None and stamp == entry[1]:
-                return entry[2]
-        except (AttributeError, TypeError, ValueError, RuntimeError):
-            # Let the original validator determine the public failure.
-            stamp = None
-        _VALIDATION_CACHE.pop(key, None)
-
-    shape = _validate_inputs(packed, quant_state)
-
-    if stamp is None:
-        try:
-            stamp = _validation_stamp(packed, quant_state)
-        except (AttributeError, TypeError, ValueError, RuntimeError):
-            # An otherwise valid tensor need not be cacheable.
-            return shape
-
-    if stamp is not None:
-        if len(_VALIDATION_CACHE) >= _VALIDATION_CACHE_LIMIT:
-            _VALIDATION_CACHE.pop(next(iter(_VALIDATION_CACHE)))
-        _VALIDATION_CACHE[key] = (quant_state, stamp, shape)
-
-    return shape
-
-
-def _launch_one(packed, quant_state, out, count):
-    lut = _device_lut(packed.device.index)
-    soup_nf4_dequant_kernel[(triton.cdiv(count, 2 * _BLOCK),)](
-        packed,
-        quant_state.absmax,
-        quant_state.state2.absmax,
-        quant_state.state2.code,
-        quant_state.offset,
-        lut,
-        out,
-        count,
-        BLOCK=_BLOCK,
-        num_warps=_NUM_WARPS,
-        enable_fp_fusion=False,
-    )
-
-
 def nf4_dequantize(packed, quant_state, out=None):
     """Return a contiguous [N, K] fp16 tensor, optionally writing into out.
 
-    Contiguous slices with nonzero storage offsets are supported.
-    Output storage must be disjoint from packed and all input metadata.
+    Contiguous slices with nonzero storage offsets are supported. For example:
+
+        buffer = torch.empty((17920, 1536), device="cuda", dtype=torch.float16)
+        nf4_dequantize(gate, gate_state, out=buffer[:8960])
+        nf4_dequantize(up, up_state, out=buffer[8960:])
+
+    These are two launches of the same kernel; each launch uses its weight's
+    own quantization metadata.
     """
-    n, k = _cached_validate_inputs(packed, quant_state)
+    n, k = _validate_inputs(packed, quant_state)
 
     if out is None:
         out = torch.empty((n, k), device=packed.device, dtype=torch.float16)
@@ -340,11 +198,23 @@ def nf4_dequantize(packed, quant_state, out=None):
         if out.requires_grad:
             raise ValueError("out must not require gradients")
 
-    if torch.cuda.current_device() == packed.device.index:
-        _launch_one(packed, quant_state, out, n * k)
-    else:
-        with torch.cuda.device(packed.device):
-            _launch_one(packed, quant_state, out, n * k)
+    # The caller must provide output storage disjoint from the input metadata.
+    # This context selects the device without creating a stream.
+    with torch.cuda.device(packed.device):
+        lut = _device_lut(packed.device.index)
+        soup_nf4_dequant_kernel[(triton.cdiv(n * k, _BLOCK),)](
+            packed,
+            quant_state.absmax,
+            quant_state.state2.absmax,
+            quant_state.state2.code,
+            quant_state.offset,
+            lut,
+            out,
+            n * k,
+            BLOCK=_BLOCK,
+            num_warps=_NUM_WARPS,
+            enable_fp_fusion=False,
+        )
     return out
 
 
@@ -399,7 +269,7 @@ def soup_matmul_4bit(A, B, quant_state, out=None, bias=None):
         return original(A, B, quant_state=quant_state, out=out, bias=bias)
 
     try:
-        n, k = _cached_validate_inputs(B, quant_state)
+        n, k = _validate_inputs(B, quant_state)
     except (TypeError, ValueError):
         return original(A, B, quant_state=quant_state, out=out, bias=bias)
 
