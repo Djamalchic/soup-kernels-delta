@@ -97,7 +97,7 @@ def test_m5_flags_reach_the_modules(recorder, monkeypatch, on):
     module defaults (before apply()) are v8b's."""
     from solution.kernels import head_ce
 
-    assert solution.USE_BWD_CHUNKING is True and solution.BWD_ROW_CHUNKS == 4
+    assert solution.USE_BWD_CHUNKING is False and solution.BWD_ROW_CHUNKS == 4  # M5 off in v9b
     assert solution.BWD_CHUNK_MIN_ROWS == 512 and solution.K2_VOCAB_TILE == 8192
     assert head_ce.VOCAB_TILE_V8 == 16384
     assert mlp_recompute.BWD_ROW_CHUNKS == 1 and head_ce.VOCAB_TILE == 16384
