@@ -33,6 +33,18 @@ DEV = "cuda"
 SEQ = 150
 LENGTHS = (7, 150, 1, 90)  # a length-1 row and a full row; N = 248 >= 129, B*T = 600
 
+# The backward runs on loss * LOSS_SCALE, as in fp16 training: Trainer's fp16 goes through
+# accelerate, which builds torch.amp.GradScaler("cuda", **kwargs) with empty kwargs unless a handler
+# is given (accelerate 1.14.0 accelerator.py:577-583, utils/modeling.py:2147), so torch's default
+# init_scale 2**16 (torch/amp/grad_scaler.py) is the first scale. Without it the
+# activation gradients of these small models are ~1e-8..1e-5, at or below fp16's smallest normal
+# 2**-14 = 6.1e-5, where the fixed spacing 2**-24 = 6e-8 is a relative step of up to 1e-2 per
+# element: any 1-ulp change upstream became a 0.4 % change of lora_A's gradient (the old failure,
+# 1.1599e-04 vs 1.1593e-04 is exactly one fp16 step). Scaled, they sit in the normal range where a
+# rounding is at most u = 2**-11 relative. Largest scaled value: d loss / d logit <= 1 / (~235
+# labelled tokens) -> ~280, far below the fp16 maximum 65504 (run() also asserts finite grads).
+LOSS_SCALE = 2.0 ** 16
+
 
 # ---------------------------------------------------------------------------------------------
 # Helpers
@@ -150,12 +162,15 @@ def run(pm, batch, forward, seed=1234, **extra):
         with torch.autocast("cuda", dtype=torch.float16):
             out = pm(**batch, use_cache=False, **extra)
         rng_after = torch.cuda.get_rng_state()
-        out.loss.backward()
+        # Backward through the scaled loss, as fp16 training does (see LOSS_SCALE).
+        (out.loss * LOSS_SCALE).backward()
     finally:
         for h in hooks:
             h.remove()
     grads = {n: p.grad.detach().clone() for n, p in pm.named_parameters() if p.requires_grad}
     assert grads and all(g is not None for g in grads.values())
+    assert all(torch.isfinite(g).all() for g in grads.values())  # LOSS_SCALE must not overflow
+    grads = {n: g / LOSS_SCALE for n, g in grads.items()}  # a power of two: exact in fp32
     return out.loss.detach().float(), rec, rng_after, grads
 
 
@@ -179,22 +194,27 @@ def test_pack_unpack_roundtrip_and_gradients():
     mask[2, :17] = 1
     idx = mask.reshape(-1).nonzero().view(-1)
     n = idx.numel()
+
+    # Every random input is drawn before the RNG snapshot: torch.randn on CUDA advances the Philox
+    # offset that torch.cuda.get_rng_state() returns, so a snapshot taken before these draws can
+    # never match (that was the "assert False" here). Only pack/unpack and their backward run
+    # between the snapshot and the final check.
+    x = torch.randn(n, width, device=DEV, requires_grad=True)
+    g = torch.randn(batch, seq, width, device=DEV)
+    z = torch.randn(batch, seq, width, device=DEV, dtype=torch.float16, requires_grad=True)
+    h = torch.randn(n, width, device=DEV, dtype=torch.float16)
     rng = torch.cuda.get_rng_state()
 
-    x = torch.randn(n, width, device=DEV, requires_grad=True)
     y = unpad.unpack_rows(x, idx, batch, seq)
     assert y.shape == (batch, seq, width) and y.dtype == x.dtype
     flat = y.detach().reshape(-1, width)
     assert torch.equal(flat[idx], x.detach())
     assert (flat[mask.reshape(-1) == 0] == 0).all()
-    g = torch.randn(batch, seq, width, device=DEV)
     y.backward(g)
     assert torch.equal(x.grad, g.reshape(-1, width)[idx])
 
-    z = torch.randn(batch, seq, width, device=DEV, dtype=torch.float16, requires_grad=True)
     p = unpad.pack_rows(z, idx)
     assert p.dtype == torch.float16 and torch.equal(p.detach(), z.detach().reshape(-1, width)[idx])
-    h = torch.randn(n, width, device=DEV, dtype=torch.float16)
     p.backward(h)
     zg = z.grad.reshape(-1, width)
     assert z.grad.dtype == torch.float16
@@ -245,7 +265,19 @@ def test_row_indices_rejects(case):
 # Whole model against base
 # ---------------------------------------------------------------------------------------------
 
-def check_against_base(pm, batch, base_run, new_run, loss_rtol=1e-4, grad_rtol=2e-3):
+# grad_rtol (with the loss scaled, see LOSS_SCALE). The only arithmetic U changes is the row count M
+# of the GEMMs that run on [N, C]: gate/up/down forward and their input gradients backward. cuBLAS
+# (and bitsandbytes) choose tiles and splits by M, so each of those fp16 outputs may round to a
+# neighbouring fp16 value: at most u = 2**-11 = 4.9e-4 relative per element. With 3 forward + 3
+# backward such GEMMs per layer and 2 layers, a LoRA gradient sees at most 12 of them on any path:
+# first-order worst case 12 u = 5.9e-3, independent signs sqrt(12) u = 1.7e-3. rel() is a norm over
+# the whole tensor, so it stays near the latter; 1e-2 keeps ~1.7x over the worst case for the
+# nonlinear steps in between (SiLU, softmax). With K1/K3/K4 every layer adds the fused
+# add+RMSNorm output and the dequantised 4-bit MLP on [N, C] (more fp16 roundings, K up to 8960):
+# test_composes_with_k1_k3_k4 doubles it to 2e-2. A real bug moves gradients by O(1): a gradient
+# routed to the neighbouring row gives rel ~1 (test_grad_check_catches_misrouted_rows), a dropped
+# residual or a moved row already fails the hidden-state check above at 5e-3.
+def check_against_base(pm, batch, base_run, new_run, loss_rtol=1e-4, grad_rtol=1e-2):
     loss0, rec0, rng0, grads0 = base_run
     loss1, rec1, rng1, grads1 = new_run
     real = batch["attention_mask"].bool()
@@ -291,6 +323,43 @@ def test_matches_base_loss_grads_and_rng(forwards):
     new_run = run(pm, batch, patched)
     assert counts()["packed"] == before["packed"] + 1
     check_against_base(pm, batch, base_run, new_run)
+
+
+class _MisroutedUnpack(torch.autograd.Function):
+    """A planted bug for the test below: the forward of unpad._UnpackRows, but the backward hands
+    every real row the gradient of the real row before it."""
+
+    @staticmethod
+    def forward(ctx, x, idx, rows):
+        ctx.save_for_backward(idx)
+        out = x.new_zeros((rows, x.shape[-1]))
+        out.index_copy_(0, idx, x)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        (idx,) = ctx.saved_tensors
+        return grad.index_select(0, idx.roll(1)), None, None
+
+
+def test_grad_check_catches_misrouted_rows(forwards, monkeypatch):
+    """The gradient tolerance is loose enough for fp16 GEMM noise, not for a bug that only shows in
+    backward: with gradients routed to the wrong rows the forward still matches base (RNG, inputs,
+    hidden states, loss), and only the gradient check may and must fail."""
+    base, patched = forwards
+    pm = build()
+    batch = make_batch(pm.config.vocab_size)
+    base_run = run(pm, batch, base)
+    # _layer_packed and _packed_forward look unpack_rows up in the module at call time.
+    monkeypatch.setattr(unpad, "unpack_rows", lambda x, idx, batch_, seq_: _MisroutedUnpack.apply(
+        x, idx, batch_ * seq_).view(batch_, seq_, x.shape[-1]))
+    before = counts()
+    bad_run = run(pm, batch, patched)
+    assert counts()["packed"] == before["packed"] + 1
+    worst = max(rel(bad_run[3][n], base_run[3][n]) for n in base_run[3])
+    assert worst > 0.1  # >= 10x the tolerance (1e-2) of check_against_base
+    with pytest.raises(AssertionError, match="lora_"):  # the message is the parameter name
+        check_against_base(pm, batch, base_run, bad_run)
 
 
 def test_trainer_kwargs_take_the_fast_path(forwards):
@@ -538,8 +607,9 @@ def test_composes_with_k1_k3_k4(forwards, monkeypatch, order):
     assert counts()["packed"] == before["packed"] + 1
     if k3 is not None:
         assert n_base == len(fused_calls) - n_base == pm.config.num_hidden_layers
-    # Several fp16 GEMMs now see M = N instead of B*T: allow a little more than the plain test.
-    check_against_base(pm, batch, base_run, new_run, loss_rtol=2e-4, grad_rtol=5e-3)
+    # Several fp16 GEMMs and the fused kernels now see M = N instead of B*T: twice the plain
+    # test's gradient tolerance (derivation above check_against_base).
+    check_against_base(pm, batch, base_run, new_run, loss_rtol=2e-4, grad_rtol=2e-2)
 
 
 def test_composes_with_k2_head(forwards, monkeypatch):
