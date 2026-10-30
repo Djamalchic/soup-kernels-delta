@@ -14,6 +14,16 @@ if not torch.cuda.is_available():
 
 peft = pytest.importorskip("peft")
 
+# The Kaggle image ships torchao 0.10; PEFT's LoRA dispatcher raises ImportError for torchao < 0.16
+# (peft/import_utils.py:147, reached from peft/tuners/lora/torchao.py:160) when it wraps q_proj/v_proj.
+# These tests never use torchao, so tell that dispatcher it is absent.
+try:
+    import peft.tuners.lora.torchao as _peft_torchao
+
+    _peft_torchao.is_torchao_available = lambda: False
+except ImportError:
+    pass
+
 from transformers import Qwen2Config, Qwen2ForCausalLM  # noqa: E402
 from transformers.models.qwen2 import modeling_qwen2 as mq  # noqa: E402
 
