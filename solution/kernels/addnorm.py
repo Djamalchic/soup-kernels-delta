@@ -5,23 +5,31 @@ Reference math, transformers 5.16.1 models/qwen2/modeling_qwen2.py:
 - Qwen2DecoderLayer.forward (lines 291, 294-295): residual = residual + attn_out;
   post_attention_layernorm(residual)
 
-Scope (checked by the callers in solution/layers.py; anything else stays on the original path):
-the residual stream and the norm weights are fp32 (base Soup keeps the residual stream in fp32, see
-solution/mlp.py docstring), so cast_in() is the identity and y = w * (u * r) in fp32, the base
-output dtype promote(fp32, fp32). Under accelerate's fp16 autocast the attention output (delta)
-arrives in fp16: bitsandbytes Linear4bit returns its input dtype (bitsandbytes/nn/modules.py:626,
-637) and peft's LoRA adds an fp16 update to it (peft/tuners/lora/bnb.py:527-552). add_rmsnorm casts
-the delta to fp32 in Python before the launch: exact, the same value base's type-promoting add
-uses, and its gradient is rounded back to fp16 by autograd exactly like base AddBackward. So every
-pointer is fp32 and each kernel compiles once (PLAN.md K3 budget: 2 specializations).
+Scope (checked by the callers in solution/layers.py, solution/unpad.py and solution/fused_block.py;
+anything else stays on the original path): the residual stream and the norm weights are fp32 (base
+Soup keeps the residual stream in fp32, see solution/mlp.py docstring), so cast_in() is the identity
+and y = w * (u * r) in fp32, the base output dtype promote(fp32, fp32). Under accelerate's fp16
+autocast the attention output (delta) arrives in fp16: bitsandbytes Linear4bit returns its input
+dtype (bitsandbytes/nn/modules.py:626, 637) and peft's LoRA adds an fp16 update to it
+(peft/tuners/lora/bnb.py:527-552).
+
+v6 (peak-timing variant): the delta pointer is fp16. The kernels load it and widen it to fp32
+(exact), which is the value base's type-promoting add uses, so r = residual + f32(delta) is the
+same fp32 add as before; the Python-side fp32 copy of the delta (alive during the launch) is gone.
+The rmsnorm-only paths pass a one-element fp16 dummy for the delta, so in training every pointer
+keeps one dtype and each kernel still compiles once (an fp32 delta, which no training path
+produces, would add a second variant). New runtime flags, all in do_not_specialize:
+- fwd `store_r`: 0 skips the store of r (solution/fused_block.py recomputes y in backward without
+  materialising r);
+- bwd `has_delta`: the kernel rebuilds r = X + f32(D) with the forward's exact expression instead of
+  reading a saved r, so a caller can keep (residual, fp16 delta) for backward instead of the fp32
+  r (solution/fused_block.py). With has_delta = 0 the X row is used unchanged (tl.where, no + 0.0).
 
 Kernels:
 - soup_addnorm_fwd_kernel: optional add (runtime flag has_delta), stores r (fp32) only when it
-  added, y, rstd.
+  added and store_r is set, y, rstd.
 - soup_addnorm_bwd_kernel: dx = rstd * (g - x * rstd^2 * mean(g * x)) with g = w * dy, plus the
   incoming residual gradient dr (runtime flag has_dr). No dW: the norm weights are frozen.
-Saved for backward: x (or r) fp32, rstd fp32 [rows] and the weight (save_for_backward keeps a
-reference to the parameter, no copy): the same activations base autograd keeps (input and rsqrt).
 
 Idea credit: fused add + RMSNorm as in Liger-Kernel and Unsloth; code written from scratch from the
 formula above. tl.rsqrt and the needs_input_grad gating follow the reviewed GPT-6-Astra K3 draft.
@@ -36,10 +44,10 @@ BLOCK = 2048  # next power of two >= HIDDEN_SIZE
 NUM_WARPS = 4  # 128 threads x 16 elements per row; 8 is the alternative to time on T4
 
 
-@triton.jit(do_not_specialize=["has_delta", "eps"])
+@triton.jit(do_not_specialize=["has_delta", "store_r", "eps"])
 def soup_addnorm_fwd_kernel(
     X, D, W, Y, R, RSTD,
-    has_delta, eps,
+    has_delta, store_r, eps,
     H: tl.constexpr, BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)  # grid = (rows,), one row per program
@@ -51,7 +59,7 @@ def soup_addnorm_fwd_kernel(
     x = tl.load(X + offs, mask=cmask, other=0.0).to(tl.float32)
     d = tl.load(D + offs, mask=add, other=0.0).to(tl.float32)
     x = x + d  # residual + f32(delta): the same single fp32 add as base (line 291)
-    tl.store(R + offs, x, mask=add)  # plain norm: nothing stored, R is a dummy pointer
+    tl.store(R + offs, x, mask=add & (store_r != 0))  # otherwise nothing stored, R may be a dummy
 
     w = tl.load(W + col, mask=cmask, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=0) / H
@@ -61,10 +69,10 @@ def soup_addnorm_fwd_kernel(
     tl.store(RSTD + row, rstd)
 
 
-@triton.jit(do_not_specialize=["has_dr"])
+@triton.jit(do_not_specialize=["has_dr", "has_delta"])
 def soup_addnorm_bwd_kernel(
-    DY, DR, X, W, RSTD, DX,
-    has_dr,
+    DY, DR, X, D, W, RSTD, DX,
+    has_dr, has_delta,
     H: tl.constexpr, BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -73,6 +81,10 @@ def soup_addnorm_bwd_kernel(
     offs = row * H + col
 
     x = tl.load(X + offs, mask=cmask, other=0.0).to(tl.float32)
+    d = tl.load(D + offs, mask=cmask & (has_delta != 0), other=0.0).to(tl.float32)
+    # The forward's r = x + d, bit for bit (same fp32 operands, one IEEE add); has_delta = 0 keeps
+    # the saved row as it is.
+    x = tl.where(has_delta != 0, x + d, x)
     dy = tl.load(DY + offs, mask=cmask, other=0.0).to(tl.float32)
     w = tl.load(W + col, mask=cmask, other=0.0).to(tl.float32)
     rstd = tl.load(RSTD + row)
@@ -86,29 +98,38 @@ def soup_addnorm_bwd_kernel(
     tl.store(DX + offs, dx + dr, mask=cmask)
 
 
-def _launch_fwd(x, delta, weight, eps):
+def _dummy16(x):
+    # Never read (its loads are masked off); fp16 so the training paths keep one variant.
+    return torch.empty((1,), device=x.device, dtype=torch.float16)
+
+
+def _launch_fwd(x, delta, weight, eps, store_r=True):
+    """(r or None, y, rstd). r is returned only when delta is given and store_r is True."""
     rows = x.shape[0]
     y = torch.empty_like(x)
-    r = torch.empty_like(x) if delta is not None else y  # dummy pointer, store masked off
+    keep_r = delta is not None and store_r
+    r = torch.empty_like(x) if keep_r else y  # y doubles as a dummy pointer, its store is masked off
     rstd = torch.empty((rows,), device=x.device, dtype=torch.float32)
     if rows:
         with torch.cuda.device(x.device):
             soup_addnorm_fwd_kernel[(rows,)](
-                x, delta if delta is not None else x, weight, y, r, rstd,
-                1 if delta is not None else 0, eps,
+                x, delta if delta is not None else _dummy16(x), weight, y, r, rstd,
+                1 if delta is not None else 0, 1 if keep_r else 0, eps,
                 H=HIDDEN_SIZE, BLOCK=BLOCK, num_warps=NUM_WARPS,
             )
-    return (r if delta is not None else None), y, rstd
+    return (r if keep_r else None), y, rstd
 
 
-def _launch_bwd(dy, dr, x, weight, rstd):
+def _launch_bwd(dy, dr, x, weight, rstd, delta=None):
+    """dx (+ dr). With delta, x is the residual before the add and the kernel rebuilds x + delta."""
     rows = x.shape[0]
     dx = torch.empty_like(x)
     if rows:
         with torch.cuda.device(x.device):
             soup_addnorm_bwd_kernel[(rows,)](
-                dy, dr if dr is not None else dy, x, weight, rstd, dx,
-                1 if dr is not None else 0,
+                dy, dr if dr is not None else dy, x,
+                delta if delta is not None else _dummy16(x), weight, rstd, dx,
+                1 if dr is not None else 0, 1 if delta is not None else 0,
                 H=HIDDEN_SIZE, BLOCK=BLOCK, num_warps=NUM_WARPS,
             )
     return dx
@@ -140,6 +161,7 @@ class _AddRMSNorm(torch.autograd.Function):
         r, y, rstd = _launch_fwd(x, delta, weight, eps)
         ctx.save_for_backward(r, rstd, weight)
         ctx.set_materialize_grads(False)
+        ctx.delta_dtype = delta.dtype
         return r, y
 
     @staticmethod
@@ -150,8 +172,13 @@ class _AddRMSNorm(torch.autograd.Function):
         else:
             d = _launch_bwd(_grad(dy), _grad(dr), r, weight, rstd)
         # d(residual + delta) = (1, 1): base AddBackward also hands the same grad to both inputs.
+        # An fp16 delta gets the fp16 rounding of it, which is what base's ToCopyBackward of the
+        # fp32 promotion (and v5's explicit delta.to(fp32)) produced.
         need_x, need_delta = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
-        return (d if need_x else None), (d if need_delta else None), None, None
+        d_delta = None
+        if need_delta and d is not None:
+            d_delta = d if d.dtype == ctx.delta_dtype else d.to(ctx.delta_dtype)
+        return (d if need_x else None), d_delta, None, None
 
 
 def norm_ok(x, weight):
@@ -183,8 +210,6 @@ def add_rmsnorm(residual, delta, weight, eps):
     """(residual + delta, RMSNorm(residual + delta)) in one kernel. Caller checks norm_ok and that
     delta is a CUDA fp16/fp32 tensor of the same shape and device as residual."""
     shape = residual.shape
-    if delta.dtype != torch.float32:
-        delta = delta.to(torch.float32)  # exact; autograd rounds its grad back like base AddBackward
     x2 = (residual if residual.is_contiguous() else residual.contiguous()).view(-1, HIDDEN_SIZE)
     d2 = (delta if delta.is_contiguous() else delta.contiguous()).view(-1, HIDDEN_SIZE)
     r, y = _AddRMSNorm.apply(x2, d2, weight, float(eps))

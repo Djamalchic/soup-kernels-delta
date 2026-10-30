@@ -50,6 +50,11 @@ USE_MLP_RECOMPUTE = False
 RECOMPUTE_GATE = True
 # "example": the starter kit's SwiGLU backward (bit-exact with K4); "torch": plain torch fp32 math.
 SWIGLU_BACKWARD = "example"
+# v6: launch the example's SwiGLU backward kernel with its outputs written over its own inputs
+# (dgate over grad, dup over gate) when gate was recomputed here. Same kernel, same arguments
+# otherwise, so the same compiled variant and the same bits; two [tokens, 8960] fp16 buffers fewer
+# at the moment of the MLP backward (see _swiglu_backward_inplace).
+INPLACE_SWIGLU_BACKWARD = True
 
 _PATCH_MARK = "_soup_delta_mlp_recompute"
 _PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")
@@ -63,6 +68,8 @@ _NOT_TRAINING = "not a training call"
 
 _swiglu_forward = None  # set by the patch: solution.swiglu.swiglu
 _swiglu_example_backward = None  # set by the patch: solution.swiglu.SwiGLU.backward, if present
+# set by the patch: (solution.swiglu.example_swiglu_bwd_kernel, solution.swiglu.BLOCK), if present
+_swiglu_example_kernel = None
 _warned = False
 
 
@@ -109,6 +116,85 @@ def _swiglu_backward(dh, gate, up):
         except (AttributeError, TypeError, ValueError):
             pass  # the example's API changed: same math in torch below
     return _swiglu_backward_torch(dh, gate, up)
+
+
+def _inplace_ok(dh, gate, up):
+    if not INPLACE_SWIGLU_BACKWARD or SWIGLU_BACKWARD != "example" or _swiglu_example_kernel is None:
+        return False
+    return (dh.dtype == gate.dtype == up.dtype == torch.float16
+            and dh.shape == gate.shape == up.shape
+            and dh.is_cuda and gate.device == dh.device and up.device == dh.device
+            and dh.is_contiguous() and gate.is_contiguous() and up.is_contiguous()
+            and dh.data_ptr() != gate.data_ptr() and dh.data_ptr() != up.data_ptr()
+            and gate.data_ptr() != up.data_ptr())
+
+
+def _swiglu_backward_inplace(dh, gate, up):
+    """(dgate, dup) = the example's SwiGLU backward, written into dh (dgate) and gate (dup).
+
+    The example kernel (`swiglu.py:25-37`) loads grad, gate and up at its offsets once, then stores
+    dgate = f(grad, up, gate) and dup = f(grad, gate). Every store depends on the load of the
+    buffer it overwrites (dgate needs grad, dup needs gate), so no compiler reordering can store
+    before that load; programs touch disjoint offsets. `up` is not written: dup does not depend on
+    up, so writing it there could be reordered before up's load. The launch is the example
+    wrapper's own (`swiglu.py:57-60`: grid cdiv(n, BLOCK), the same BLOCK, fp16 pointers, the
+    same n), so Triton reuses its compiled variant. The caller passes fresh dh and gate buffers
+    that nothing else references.
+    """
+    kernel, block = _swiglu_example_kernel
+    n = gate.numel()
+    kernel[((n + block - 1) // block,)](dh, gate, up, dh, gate, n, BLOCK=block)
+    return dh, gate
+
+
+def _down_input_grad(grad_out, down_proj):
+    """dh = grad_out @ dequant(W_down) (MatMul4Bit.backward, `_functions.py:384`)."""
+    weight = _dequantize_weight(down_proj, grad_out.dtype)
+    dh = torch.matmul(grad_out, weight)
+    del weight
+    return dh
+
+
+def _gate_up_input_grad(dh_box, x16, gate_proj, up_proj, g_saved=None):
+    """Steps 2-4 of the S4 backward from dh: recompute g/u, SwiGLU backward, dx16.
+
+    dh comes in a one-element list that is emptied here, so no caller frame keeps dh alive and
+    its buffer (or, in place, its reuse as dgate) is the only one of its size.
+    """
+    dh = dh_box.pop()
+    # 2. Recompute through the layers. The forward ran with fp16 operands, where fp16 autocast
+    #    casts nothing, so autocast is switched off here: if a caller ever runs backward inside
+    #    an autocast region, the recompute still sees the forward's dtypes.
+    with torch.autocast(x16.device.type, enabled=False):
+        g = g_saved if g_saved is not None else gate_proj(x16)
+        u = up_proj(x16)
+
+    # 3. SwiGLU backward.
+    if g_saved is None and _inplace_ok(dh, g, u):
+        dg, du = _swiglu_backward_inplace(dh, g, u)
+    else:
+        dg, du = _swiglu_backward(dh, g, u)
+    del dh, g, u
+
+    # 4. gate_proj and up_proj input gradients, summed in fp16 like autograd's accumulation of
+    #    two gradients into x16 (one rounded fp16 add; IEEE addition is commutative).
+    weight = _dequantize_weight(gate_proj, dg.dtype)
+    dx = torch.matmul(dg, weight)
+    del weight, dg
+    weight = _dequantize_weight(up_proj, du.dtype)
+    dx.add_(torch.matmul(du, weight))
+    return dx
+
+
+def mlp_forward_nograd(x16, gate_proj, up_proj, down_proj):
+    """down_proj(silu(gate_proj(x16)) * up_proj(x16)) with nothing kept; call with grad off."""
+    g = gate_proj(x16)
+    u = up_proj(x16)
+    h = _swiglu_forward(g, u)
+    del g, u
+    out = down_proj(h)
+    del h
+    return out
 
 
 def _active_nf4():
@@ -180,32 +266,14 @@ class SoupMLPRecompute(torch.autograd.Function):
             return None, None, None, None, None
         saved = ctx.saved_tensors
         x16 = saved[0]
+        g_saved = saved[1] if len(saved) > 1 else None
+        del saved
         gate_proj, up_proj, down_proj = ctx.layers
 
         # 1. down_proj input gradient first, so its dense weight is freed before the recompute.
-        weight = _dequantize_weight(down_proj, grad_out.dtype)
-        dh = torch.matmul(grad_out, weight)
-        del weight
-
-        # 2. Recompute through the layers. The forward ran with fp16 operands, where fp16 autocast
-        #    casts nothing, so autocast is switched off here: if a caller ever runs backward inside
-        #    an autocast region, the recompute still sees the forward's dtypes.
-        with torch.autocast(x16.device.type, enabled=False):
-            g = saved[1] if len(saved) > 1 else gate_proj(x16)
-            u = up_proj(x16)
-        del saved
-
-        # 3. SwiGLU backward.
-        dg, du = _swiglu_backward(dh, g, u)
-        del dh, g, u
-
-        # 4. gate_proj and up_proj input gradients, summed in fp16 like autograd's accumulation of
-        #    two gradients into x16 (one rounded fp16 add; IEEE addition is commutative).
-        weight = _dequantize_weight(gate_proj, dg.dtype)
-        dx = torch.matmul(dg, weight)
-        del weight, dg
-        weight = _dequantize_weight(up_proj, du.dtype)
-        dx.add_(torch.matmul(du, weight))
+        # 2-4. Recompute g/u, SwiGLU backward (in place when g was recomputed), dx16.
+        dx = _gate_up_input_grad([_down_input_grad(grad_out, down_proj)], x16, gate_proj, up_proj,
+                                 g_saved)
         return dx, None, None, None, None
 
 
@@ -285,7 +353,7 @@ def patch_qwen2_mlp_recompute():
     Installs K4 first if needed, and marks the S4 forward with K4's mark too, so calling
     patch_qwen2_mlp_fp16() after this is a no-op instead of wrapping S4 inside K4.
     """
-    global _swiglu_forward, _swiglu_example_backward
+    global _swiglu_forward, _swiglu_example_backward, _swiglu_example_kernel
     from transformers.models.qwen2 import modeling_qwen2
 
     from . import swiglu as example
@@ -299,6 +367,9 @@ def patch_qwen2_mlp_recompute():
     _swiglu_forward = example.swiglu
     backward = getattr(getattr(example, "SwiGLU", None), "backward", None)
     _swiglu_example_backward = backward if callable(backward) else None
+    kernel = getattr(example, "example_swiglu_bwd_kernel", None)
+    block = getattr(example, "BLOCK", None)
+    _swiglu_example_kernel = (kernel, block) if kernel is not None and type(block) is int else None
 
     def forward(self, x):
         if USE_MLP_RECOMPUTE:

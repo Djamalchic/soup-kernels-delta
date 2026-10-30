@@ -42,12 +42,20 @@ projections would draw RNG on N rows); N >= 129 and at least 1/32 of the rows pa
 while guards run means the original (Soup's tests pass fake modules); nothing is retried once
 attention may have consumed RNG.
 
+v6 peak-timing additions, both bit-identical to the ops they replace and both off unless apply()
+switches them on: the attention call runs inside solution/saved_compact.py's attention_scope (A:
+SDPA keeps one head per GQA group of its repeated key/value; D: LoRA keep-masks and LoRA-A inputs
+keep only the real rows), and with K3 the add + norm + S4 MLP + residual add run as
+solution/fused_block.py's single node, which saves (r, a) instead of (r_mid, x16).
+
 No Triton kernel here (gather/scatter are torch index ops); nothing runs on CUDA at import or patch
 time. Idea credit: removing padding for token-wise ops as in ByteDance's Effective Transformer and
 the "unpad" path of FlashAttention's varlen BERT; code written from scratch.
 """
 
+import contextlib
 import functools
+import importlib
 
 import torch
 
@@ -319,22 +327,44 @@ def _delta_ok(residual, delta):
 # The packed forward
 # ---------------------------------------------------------------------------------------------
 
+def _attention_scope(idx, batch, seq, width):
+    """v6: saved_compact.attention_scope when A or D is on, else a no-op context."""
+    sc = _REFS.get("saved_compact")
+    if sc is not None and (sc.USE_SDPA_KV_COMPACT or sc.USE_LORA_ROW_COMPACT):
+        return sc.attention_scope(idx, batch, seq, width)
+    return contextlib.nullcontext()
+
+
 def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3):
     """One decoder layer, modeling_qwen2.py:279-298, with the token-wise ops on [N, C]."""
     x = layer.input_layernorm(r)  # line 280, row-wise
-    a_bt, _ = layer.self_attn(  # lines 282-290: the same arguments and kwargs, base shapes
-        hidden_states=unpack_rows(x, idx, batch, seq),
-        attention_mask=mask,
-        position_ids=pos_ids,
-        past_key_values=None,
-        use_cache=use_cache,
-        position_embeddings=pos_emb,
-        **kwargs,
-    )
+    x_bt = unpack_rows(x, idx, batch, seq)  # exact zeros on the padding rows
+    del x
+    # v6 A + D (solution/saved_compact.py): smaller saved tensors inside attention, same values.
+    with _attention_scope(idx, batch, seq, x_bt.shape[-1]):
+        a_bt, _ = layer.self_attn(  # lines 282-290: the same arguments and kwargs, base shapes
+            hidden_states=x_bt,
+            attention_mask=mask,
+            position_ids=pos_ids,
+            past_key_values=None,
+            use_cache=use_cache,
+            position_embeddings=pos_emb,
+            **kwargs,
+        )
+    del x_bt
     a = pack_rows(a_bt, idx)
     del a_bt
     ln2 = layer.post_attention_layernorm
     if k3 is not None:
+        # v6 B (solution/fused_block.py): add + norm + S4 MLP + residual add as one node that
+        # saves (r, a) instead of (r_mid, x16); bit-identical to the ops below.
+        fb = _REFS.get("fused_block")
+        try:  # a guard reads only; evaluating it consumes no RNG, so falling through is safe
+            fused = fb is not None and fb.fused_ok(layer, r, a, _REFS["mlp_cls"], _REFS["norm_cls"])
+        except Exception:  # noqa: BLE001
+            fused = False
+        if fused:
+            return fb.add_norm_mlp(r, a, layer)
         add_rmsnorm, norm_ok = k3
         weight = getattr(ln2, "weight", None)
         # The conditions of K3's own layer patch (solution/layers.py), on [N, C].
@@ -424,6 +454,7 @@ def patch_qwen2_model_unpad():
         from transformers.models.qwen2 import modeling_qwen2 as mq
 
         model_cls, layer_cls, norm_cls = mq.Qwen2Model, mq.Qwen2DecoderLayer, mq.Qwen2RMSNorm
+        mlp_cls = mq.Qwen2MLP
         mq.create_causal_mask, mq.BaseModelOutputWithPast  # noqa: B018 - both must exist
     except Exception:  # noqa: BLE001 - a missing or fake library means nothing to patch
         return False
@@ -439,8 +470,15 @@ def patch_qwen2_model_unpad():
 
     layer_forward = _innermost_layer_forward(layer_cls.forward)
     refs = dict(modeling=mq, model_cls=model_cls, layer_cls=layer_cls, norm_cls=norm_cls,
+                mlp_cls=mlp_cls,
                 layer_forward=(layer_forward if _is_genuine(layer_forward, mq.__name__,
                                                             "Qwen2DecoderLayer.forward") else None))
+    # v6 helpers (pure Python, no CUDA at import); missing ones just keep v5's ops.
+    for key, name in (("fused_block", "fused_block"), ("saved_compact", "saved_compact")):
+        try:
+            refs[key] = importlib.import_module(f"{__package__}.{name}")
+        except Exception:  # noqa: BLE001
+            refs[key] = None
     try:
         from transformers.utils import output_capturing as oc
 

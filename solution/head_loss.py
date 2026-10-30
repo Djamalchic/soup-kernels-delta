@@ -23,6 +23,29 @@ Soup's config switch `training.stream_loss_chunk` is not touched, no trainer arg
 the trainer class is not replaced. Importing this module and calling `patch_head_loss()` perform no
 CUDA work. Any exception while a guard is evaluated (Soup's tests pass MagicMock trainers and fake
 modules) sends the call to the original.
+
+3. Lossless fp16 storage of the frozen tied embedding / lm_head (`store_head_fp16`, flag
+   STORE_HEAD_FP16), done once, on the first training step that takes the fused path, before its
+   forward. Why it is exact: on a T4 Soup loads a LoRA base in fp16 (`torch_dtype` at
+   soup_cli/trainer/sft.py:1682 from `_resolve_load_dtype`, :1540-1581 -> utils/gpu.py:659-669 ->
+   :634-656, `return torch.float16` at :655 on pre-Ampere cards), and
+   `prepare_model_for_kbit_training` then widens every fp16 non-Params4bit parameter to fp32
+   (peft/utils/other.py:197-202, called at sft.py:1747-1755), so the
+   fp32 head holds fp16 values: 890 MiB storing 445 MiB of information. We re-check that on the
+   device for every element (`fp16(w).float() == w`, NaN refuses) and only then set
+   `param.data` to the fp16 copy (the same `param.data =` move peft makes, other.py:202), on the
+   same Parameter object, so the tie, requires_grad=False and every reference stay. Every use
+   then sees the same values as base:
+   - the embedding lookup: a forward hook on embed_tokens returns `output.float()`, the exact fp32
+     rows base's F.embedding on the fp32 weight returns (modeling_qwen2.py:356);
+   - the head: base runs it under fp16 autocast (accelerate wraps the forward,
+     accelerator.py:1818-1829), which casts the fp32 weight to fp16 anyway; K2 now slices the fp16
+     weight instead of casting it tile by tile (`kernels/head_ce.py`), and the original lm_head
+     under autocast gets the same fp16 operand.
+   The weight is frozen and not in the optimizer; the adapter does not contain it (peft saves
+   embeddings only when targeted or resized, peft/utils/save_and_load.py:421-457). Saves 445 MiB of
+   static memory (151936 x 1536 x 2 bytes) and K2's per-step cast of the head (2 passes x ~1.3 GB
+   of traffic). Any failed condition leaves the model untouched.
 """
 
 import collections.abc
@@ -30,6 +53,7 @@ import contextlib
 import contextvars
 import functools
 import logging
+import weakref
 
 import torch
 
@@ -37,6 +61,17 @@ from .kernels.head_ce import IGNORE_INDEX, SoupHeadCE
 
 _PATCH_MARK = "_soup_delta_head_ce"
 STEP_ATTR = "_soup_chunked_step"  # = soup_cli.utils.stream_loss_chunk.STEP_ATTR (line 298)
+
+# Part 3 (see the module docstring). solution.apply() sets it from solution.STORE_HEAD_FP16.
+STORE_HEAD_FP16 = False
+# Set on a Parameter whose fp32 values we moved, verified, into fp16 storage.
+_FP16_MARK = "_soup_delta_fp16_head"
+# Rows per verification chunk: an 8192 x 1536 fp32 temporary (48 MiB) at a time.
+_STORE_CHUNK_ROWS = 8192
+# Models store_head_fp16 already looked at (one attempt each; a refusal costs a sync and a copy).
+_HEAD_TRIED = weakref.WeakSet()
+# "stored" / "refused" attempts; tests and a debug notebook read it.
+HEAD_FP16_COUNTS = {"stored": 0, "refused": 0}
 
 _log = logging.getLogger(__name__)
 _warned = {"fallback": False}
@@ -189,10 +224,13 @@ def _model_fast_path_ok(model, args, kwargs):
     if type(head) is not torch.nn.Linear or head.bias is not None or not _no_module_hooks(head):
         return False
     weight = head.weight
-    # prepare_model_for_kbit_training: frozen (peft utils/other.py:185-187), fp32 (189-202).
+    # prepare_model_for_kbit_training: frozen (peft utils/other.py:185-187), fp32 (189-202); or
+    # the verified fp16 copy store_head_fp16 put in its place.
     if not isinstance(weight, torch.nn.Parameter) or weight.requires_grad:
         return False
-    if weight.dtype != torch.float32 or weight.dim() != 2 or not weight.is_cuda:
+    if weight.dtype != torch.float32 and not _is_fp16_stored(weight):
+        return False
+    if weight.dim() != 2 or not weight.is_cuda:
         return False
     if not weight.is_contiguous() or weight.device != labels.device:
         return False
@@ -241,6 +279,109 @@ def _trainer_fast_path_ok(trainer, model, inputs):
         return False
     weight = getattr(getattr(base, "lm_head", None), "weight", None)
     return isinstance(weight, torch.Tensor) and weight.is_cuda
+
+
+# ---------------------------------------------------------------------------------------------
+# Part 3: lossless fp16 storage of the frozen tied head (see the module docstring)
+# ---------------------------------------------------------------------------------------------
+
+def _is_fp16_stored(weight):
+    return weight.dtype == torch.float16 and getattr(weight, _FP16_MARK, False) is True
+
+
+def _embedding_output_to_fp32(module, args, output):
+    """Forward hook on an nn.Embedding whose weight store_head_fp16 moved to fp16: return the fp32
+    rows base's F.embedding returns from the fp32 weight (the same values, verified). Anything
+    else passes through (None keeps the output)."""
+    weight = getattr(module, "weight", None)
+    if (isinstance(output, torch.Tensor) and output.dtype == torch.float16
+            and isinstance(weight, torch.Tensor) and _is_fp16_stored(weight)):
+        return output.float()
+    return None
+
+
+def _fp16_exact_copy(w):
+    """An fp16 tensor equal to fp32 `w` element for element, or None. One host sync."""
+    w16 = torch.empty(w.shape, dtype=torch.float16, device=w.device)
+    bad = torch.zeros((), dtype=torch.bool, device=w.device)
+    for r0 in range(0, w.shape[0], _STORE_CHUNK_ROWS):
+        src = w[r0:r0 + _STORE_CHUNK_ROWS]
+        dst = w16[r0:r0 + _STORE_CHUNK_ROWS]
+        dst.copy_(src)  # round to nearest even: the cast fp16 autocast applies to the head
+        bad.logical_or_(dst.float().ne(src).any())  # NaN != NaN: refused as well
+    if bool(bad):
+        return None
+    return w16
+
+
+def _head_params_ok(params):
+    for p in params:
+        if not isinstance(p, torch.nn.Parameter) or p.requires_grad or p.grad is not None:
+            return False
+        if p.dtype != torch.float32 or p.dim() != 2 or not p.is_cuda or not p.is_contiguous():
+            return False
+    return True
+
+
+def store_head_fp16(model):
+    """Move the frozen embedding / lm_head weight of a Qwen2ForCausalLM from fp32 to fp16 storage
+    when fp16 holds every one of its values exactly. True when it did. Never raises for an
+    unexpected model; leaves it untouched unless every check passed."""
+    if type(model) is not _REFS.get("Qwen2ForCausalLM"):
+        return False
+    config = getattr(model, "config", None)
+    emb = getattr(getattr(model, "model", None), "embed_tokens", None)
+    head = getattr(model, "lm_head", None)
+    if type(emb) is not torch.nn.Embedding or type(head) is not torch.nn.Linear:
+        return False
+    # max_norm would make F.embedding renormalise the weight in place; hooks on either module
+    # would see fp16 where they saw fp32.
+    if head.bias is not None or emb.max_norm is not None or emb.sparse:
+        return False
+    if not _no_module_hooks(emb) or not _no_module_hooks(head):
+        return False
+    params = [emb.weight] if head.weight is emb.weight else [emb.weight, head.weight]
+    if not _head_params_ok(params):
+        return False
+    vocab, hidden = getattr(config, "vocab_size", -1), getattr(config, "hidden_size", -1)
+    if any(tuple(p.shape) != (vocab, hidden) for p in params):
+        return False
+    with torch.no_grad():
+        copies = []
+        for p in params:
+            copy = _fp16_exact_copy(p)
+            if copy is None:
+                return False
+            copies.append(copy)
+    # Hook first: it passes outputs through until the weight is marked, so no order of failure
+    # can leave an fp16 embedding output in the fp32 residual stream.
+    emb.register_forward_hook(_embedding_output_to_fp32)
+    for p, copy in zip(params, copies):
+        # The same in-place storage swap peft makes the other way (other.py:202): the Parameter
+        # object, its tie and its requires_grad=False are kept; the fp32 storage is freed here.
+        p.data = copy
+        setattr(p, _FP16_MARK, True)
+    return True
+
+
+def _maybe_store_head_fp16(trainer, model):
+    """Once per model, on the fused training path, before the step's forward. Only under fp16
+    mixed precision: then every forward runs in accelerate's fp16 autocast, where base itself
+    feeds the head an fp16 copy of the weight."""
+    if not STORE_HEAD_FP16:
+        return
+    args = getattr(trainer, "args", None)
+    if getattr(args, "fp16", False) is not True or getattr(args, "bf16", False) is not False:
+        return
+    base = _unwrapped_causal_lm(model)
+    if base in _HEAD_TRIED:
+        return
+    _HEAD_TRIED.add(base)
+    try:
+        stored = store_head_fp16(base)
+    except Exception:  # noqa: BLE001 - e.g. out of memory for the copy: keep fp32, train on
+        stored = False
+    HEAD_FP16_COUNTS["stored" if stored else "refused"] += 1
 
 
 # ---------------------------------------------------------------------------------------------
@@ -298,6 +439,7 @@ def compute_loss_impl(original, trainer, model, inputs, return_outputs=False,
         return original(trainer, model, inputs, return_outputs=return_outputs,
                         num_items_in_batch=num_items_in_batch)
     step_cls, step_attr, log_trl_metrics = soup
+    _maybe_store_head_fp16(trainer, model)  # part 3: once, before the first fused forward
 
     mode = "train" if trainer.model.training else "eval"  # sft_trainer.py:1201
     inputs.pop("_prediction_loss_only", None)  # sft_trainer.py:1202

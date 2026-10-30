@@ -22,6 +22,9 @@ What this module does (one `soup_head_ce_kernel`, three runtime modes):
   The last tile leaves loss = (m - z_label) + log s, entropy = log s - u / s and the argmax hit.
   Nothing of size V x H in fp16 or T x V is ever kept: at most a 48 MiB weight tile and a 64 MiB
   logits tile at T = 512.
+- When the head weight is already fp16 (solution/head_loss.py stores the frozen tied head in fp16
+  after checking on the device that fp16 holds every value exactly), the tiles are plain row slices
+  of it: no cast launches and no weight buffer. The fp16 operands are the same bits mode 2 makes.
 - Each tile runs two GEMMs, one over the labelled rows and one over the others. The backward
   repeats the labelled one with the same operands and shapes, so cuBLAS returns the same logits the
   forward state was built from. Mode 1 overwrites them in place with
@@ -32,7 +35,9 @@ What this module does (one `soup_head_ce_kernel`, three runtime modes):
 Compile: one @triton.jit, one specialization in training. Pointers are fresh allocations or slices
 at multiples of VOCAB_TILE rows (16-byte aligned); row0, col0 and mode vary and are in
 do_not_specialize; n_cols is left specialized so Triton can prove 16-element alignment for vector
-loads (16384, 4480 and both times 1536 are all multiples of 16, so training sees one variant).
+loads (16384, 4480 and both times 1536 are all multiples of 16, so training sees one variant). The
+W32 argument of modes 0 and 1 is a placeholder (never read there): it is always an fp32 tensor, so
+an fp16 head does not change the signature either.
 
 Ideas credited (no code taken): online softmax (Milakov & Gimelshein, 2018); chunked fused linear +
 cross-entropy with logits recomputed in backward (Liger-Kernel `fused_linear_cross_entropy`; Apple,
@@ -50,7 +55,9 @@ import triton.language as tl
 IGNORE_INDEX = -100
 
 # Head rows per tile. 151936 = 9 * 16384 + 4480: 10 tiles per pass. Peak extra memory at T = 512:
-# fp16 weight tile 16384 x 1536 = 48 MiB, logits tile <= 2048 x 16384 fp16 = 64 MiB.
+# fp16 weight tile 16384 x 1536 = 48 MiB (none with an fp16 head), logits tile <= 2048 x 16384
+# fp16 = 64 MiB. v6 keeps v5's 16384 (the GEMM shapes validated on Kaggle): K2 is not the moment
+# of the step's memory peak, so a smaller tile would not lower it.
 VOCAB_TILE = 16384
 # Columns per inner iteration (and elements per program in mode 2): 2048 fp32 values over 8 warps
 # is 8 per thread, no spills expected on sm_75 (check `n_spills` of the compiled kernel on Kaggle).
@@ -171,9 +178,23 @@ def _cast_tile(w32, v0, nv, wbuf, target, state):
     return wb
 
 
+def _weight_tiles(weight, H, device):
+    """(fp16 tile getter, weight buffer or None). An fp16 head is sliced, an fp32 one is cast by
+    mode 2 into one reused buffer. Any other dtype is refused (head_loss guards allow these two)."""
+    w = weight.detach()
+    if w.dtype == torch.float16:
+        return (lambda v0, nv, target, state: w[v0:v0 + nv]), None
+    if w.dtype != torch.float32:
+        raise TypeError(f"SoupHeadCE: head weight must be fp32 or fp16, got {w.dtype}")
+    tile = min(VOCAB_TILE, w.shape[0])
+    wbuf = torch.empty((tile, H), dtype=torch.float16, device=device)
+    return (lambda v0, nv, target, state: _cast_tile(w, v0, nv, wbuf, target, state)), wbuf
+
+
 class SoupHeadCE(torch.autograd.Function):
     """loss, token_entropy, token_loss, correct, labelled = SoupHeadCE.apply(
-    hidden [B,T,H] float, weight [V,H] frozen fp32, labels [B,T] int64 (unshifted, -100),
+    hidden [B,T,H] float, weight [V,H] frozen fp32 (or fp16 holding the same values),
+    labels [B,T] int64 (unshifted, -100),
     attention_mask [B,T], num_items_in_batch (tensor, int or None))
 
     loss: fp32 0-dim, sum of labelled token losses / num_items_in_batch, or / the labelled count
@@ -219,19 +240,20 @@ def _forward(ctx, hidden, weight, labels, attention_mask, num_items_in_batch):
     tgt = target.reshape(-1).index_select(0, order)
     state = torch.empty((n, _NCOL), dtype=torch.float32, device=device)
     if n > 0:
-        w32 = weight.detach()
         tile, tiles = _tiles(V)
-        wbuf = torch.empty((tile, H), dtype=torch.float16, device=device)
+        weight_tile, wbuf = _weight_tiles(weight, H, device)
         lbuf = torch.empty(max(n_lab, n_other) * tile, dtype=torch.float16, device=device)
+        wb = logits = None
         for v0, nv in tiles:
-            wb = _cast_tile(w32, v0, nv, wbuf, tgt, state)
+            wb = weight_tile(v0, nv, tgt, state)
             for row0, rows in ((0, n_lab), (n_lab, n_other)):
                 if rows == 0:
                     continue
                 logits = lbuf[:rows * nv].view(rows, nv)
                 torch.mm(h16[row0:row0 + rows], wb.t(), out=logits)
-                _launch((rows,), logits, tgt, state, state, w32, row0, nv, v0, _STATS)
-        del wbuf, lbuf
+                # W32 is not read in mode 0: `state` (fp32) keeps the signature of mode 2.
+                _launch((rows,), logits, tgt, state, state, state, row0, nv, v0, _STATS)
+        del weight_tile, wbuf, lbuf, wb, logits
 
     token_loss = torch.zeros(B * T, dtype=torch.float32, device=device)
     token_loss.index_copy_(0, order[:n_lab], state[:n_lab, _LOSS].contiguous())
@@ -263,26 +285,31 @@ def _backward(ctx, grad_loss):
     B, T, H = ctx.hidden_shape
     n_lab = h16.shape[0]
     device = h16.device
-    grad = torch.zeros((B * T, H), dtype=ctx.hidden_dtype, device=device)
     if n_lab == 0:
-        return grad.view(B, T, H)  # base: every target ignored, the logits gradient is 0
+        # base: every target ignored, the logits gradient is 0
+        return torch.zeros((B * T, H), dtype=ctx.hidden_dtype, device=device).view(B, T, H)
     # DivBackward of base's `sum / num_items_in_batch`, fp32.
     scale = (grad_loss.float() / ctx.denominator).to(torch.float32).reshape(1).contiguous()
-    w32 = weight.detach()
     tile, tiles = _tiles(weight.shape[0])
-    wbuf = torch.empty((tile, H), dtype=torch.float16, device=device)
+    weight_tile, wbuf = _weight_tiles(weight, H, device)
     lbuf = torch.empty(n_lab * tile, dtype=torch.float16, device=device)
     part = torch.empty((n_lab, H), dtype=torch.float16, device=device)
     acc = torch.empty((n_lab, H), dtype=torch.float32, device=device)
+    wb = logits = None
     for v0, nv in tiles:
-        wb = _cast_tile(w32, v0, nv, wbuf, tgt, state)
+        wb = weight_tile(v0, nv, tgt, state)
         logits = lbuf[:n_lab * nv].view(n_lab, nv)
         torch.mm(h16, wb.t(), out=logits)  # the forward's labelled GEMM, same operands and shape
-        _launch((n_lab,), logits, tgt, state, scale, w32, 0, nv, v0, _GRAD)
+        # W32 is not read in mode 1: `state` (fp32) keeps the signature of mode 2.
+        _launch((n_lab,), logits, tgt, state, scale, state, 0, nv, v0, _GRAD)
         torch.mm(logits, wb, out=part)  # the head GEMM backward of base, restricted to the tile
         if v0 == 0:
             acc.copy_(part)
         else:
             acc.add_(part)
+    # The tile buffers die before the [B*T, H] gradient is allocated (this runs at the start of
+    # the backward, next to every saved activation; K2 is not the v6 peak moment, so ~0 gain).
+    del weight_tile, wbuf, lbuf, part, wb, logits
+    grad = torch.zeros((B * T, H), dtype=ctx.hidden_dtype, device=device)
     grad.index_copy_(0, order, acc.to(grad.dtype))
     return grad.view(B, T, H)
