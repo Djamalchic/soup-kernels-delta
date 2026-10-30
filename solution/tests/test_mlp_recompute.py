@@ -4,11 +4,13 @@ and leaves anything unexpected on the K4 (or original) path.
 CUDA only (Kaggle T4). Run from the repository root: python -m pytest solution -q
 """
 
+import ast
 import contextlib
 import gc
 import inspect
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -73,6 +75,7 @@ def base_forward(monkeypatch):
     monkeypatch.setattr(rc, "USE_MLP_RECOMPUTE", False)
     monkeypatch.setattr(rc, "RECOMPUTE_GATE", True)
     monkeypatch.setattr(rc, "SWIGLU_BACKWARD", "example")
+    monkeypatch.setattr(rc, "_warned", False)
     rc.patch_qwen2_mlp_recompute()
     return base
 
@@ -81,17 +84,22 @@ def run(mlp, x, grad, monkeypatch, s4, autocast=False):
     monkeypatch.setattr(rc, "USE_MLP_RECOMPUTE", s4)
     xi = x.detach().clone().requires_grad_(True)
     ctx = torch.autocast("cuda", dtype=torch.float16) if autocast else contextlib.nullcontext()
-    with ctx:  # accelerate wraps only the forward in autocast; backward runs outside it
+    with ctx:  # accelerate wraps only the forward in autocast (accelerator.py:1818-1829)
         out = mlp(xi)
     used = uses_s4(out)
-    out.backward(grad)
+    out.backward(grad)  # outside autocast, like accelerator.backward (accelerator.py:2846)
     return out.detach(), xi.grad, used
+
+
+# [N, C] is the packed shape under unpadding (U); M = 3 / 74 / 300 / 2048 covers bnb's custom
+# kernel, K1's m <= 1536 dispatch and K1's dequant + F.linear path (nf4.py:279-299).
+SHAPES = [(1, 3, HIDDEN), (2, 37, HIDDEN), (300, HIDDEN), (4, 512, HIDDEN)]
 
 
 @pytest.mark.parametrize("recompute_gate", [True, False])
 @pytest.mark.parametrize("autocast", [False, True])
 @pytest.mark.parametrize("k1", [False, True])
-@pytest.mark.parametrize("shape", [(1, 3, HIDDEN), (2, 37, HIDDEN), (4, 512, HIDDEN)])
+@pytest.mark.parametrize("shape", SHAPES)
 def test_bit_exact_against_k4(base_forward, monkeypatch, shape, k1, autocast, recompute_gate):
     set_k1(monkeypatch, k1)
     monkeypatch.setattr(rc, "RECOMPUTE_GATE", recompute_gate)
@@ -100,12 +108,32 @@ def test_bit_exact_against_k4(base_forward, monkeypatch, shape, k1, autocast, re
     grad = torch.randn(shape, device="cuda", dtype=torch.float32)
 
     ref_out, ref_grad, ref_used = run(mlp, x, grad, monkeypatch, s4=False, autocast=autocast)
-    out, x_grad, used = run(mlp, x, grad, monkeypatch, s4=True, autocast=autocast)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="S4 MLP recompute")  # S4 must not be skipped
+        out, x_grad, used = run(mlp, x, grad, monkeypatch, s4=True, autocast=autocast)
 
     assert not ref_used and used
     assert out.dtype == ref_out.dtype == torch.float32
     assert torch.equal(out, ref_out)
     assert torch.equal(x_grad, ref_grad)
+
+
+def test_fp16_input_bit_exact(base_forward, monkeypatch):
+    set_k1(monkeypatch, True)
+    mlp = make_mlp()
+    x = torch.randn(4, 512, HIDDEN, device="cuda", dtype=torch.float16)
+    grad = torch.randn_like(x)
+    ref_out, ref_grad, _ = run(mlp, x, grad, monkeypatch, s4=False)
+    out, x_grad, used = run(mlp, x, grad, monkeypatch, s4=True)
+    assert used and out.dtype == torch.float16
+    assert torch.equal(out, ref_out) and torch.equal(x_grad, ref_grad)
+
+
+def test_k1_dequant_used_only_when_installed(monkeypatch):
+    set_k1(monkeypatch, True)
+    assert rc._active_nf4() is nf4
+    set_k1(monkeypatch, False)
+    assert rc._active_nf4() is None
 
 
 def test_torch_swiglu_backward_matches_example_kernel():
@@ -200,11 +228,12 @@ def test_no_grad_and_frozen_input_take_k4_path(base_forward, monkeypatch):
     mlp = make_mlp()
     x = torch.randn(2, 37, HIDDEN, device="cuda")
 
-    with torch.no_grad():
-        out = mlp(x)
-    assert out.grad_fn is None
-
-    out = mlp(x)  # x does not require grad: nothing to save, K4 path
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message="S4 MLP recompute")  # no training: no warning
+        with torch.no_grad():
+            out = mlp(x)
+        assert out.grad_fn is None
+        out = mlp(x)  # x does not require grad: nothing to save, K4 path
     assert not uses_s4(out)
 
     monkeypatch.setattr(rc, "USE_MLP_RECOMPUTE", False)
@@ -213,16 +242,73 @@ def test_no_grad_and_frozen_input_take_k4_path(base_forward, monkeypatch):
     assert torch.equal(out.detach(), ref)
 
 
-def test_layer_hooks_take_k4_path(base_forward, monkeypatch):
+def test_autocast_guard():
+    assert rc._autocast_ok("cuda")
+    with torch.autocast("cuda", dtype=torch.float16):
+        assert rc._autocast_ok("cuda")  # Soup's fp16 run must keep S4 alive
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        if not torch.is_autocast_enabled("cuda"):
+            pytest.skip("bf16 autocast is disabled on this GPU")
+        assert not rc._autocast_ok("cuda")
+
+
+def test_bf16_autocast_takes_k4_path(base_forward):
+    mlp = make_mlp()
+    x = torch.randn(2, 37, HIDDEN, device="cuda", requires_grad=True)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        if not torch.is_autocast_enabled("cuda"):
+            pytest.skip("bf16 autocast is disabled on this GPU")
+        assert rc._reject_reason(mlp, x) is not None  # guard only: no bf16 GEMM on a T4
+
+
+@pytest.mark.parametrize("kind", ["forward", "forward_pre", "full_backward", "full_backward_pre"])
+def test_layer_hooks_take_k4_path(base_forward, monkeypatch, kind):
     monkeypatch.setattr(rc, "USE_MLP_RECOMPUTE", True)
     mlp = make_mlp()
     calls = []
-    mlp.up_proj.register_forward_hook(lambda *args: calls.append(1))
+    register = getattr(mlp.up_proj, f"register_{kind}_hook")
+    register(lambda *args: calls.append(1))
     x = torch.randn(2, 37, HIDDEN, device="cuda", requires_grad=True)
-    out = mlp(x)
+    with pytest.warns(RuntimeWarning, match="module hooks"):
+        out = mlp(x)
     assert not uses_s4(out)
     out.sum().backward()
-    assert calls == [1]  # the hook fired once: no recompute through the hooked layer
+    assert calls == [1]  # the hook fired exactly once, as on the K4 path
+
+
+def test_global_hook_takes_k4_path(base_forward):
+    mlp = make_mlp()
+    x = torch.randn(2, 37, HIDDEN, device="cuda", requires_grad=True)
+    assert rc._reject_reason(mlp, x) is None
+    handle = torch.nn.modules.module.register_module_forward_hook(lambda *args: None)
+    try:
+        assert rc._reject_reason(mlp, x) is not None
+    finally:
+        handle.remove()
+    assert rc._reject_reason(mlp, x) is None
+
+
+def test_weight_guards(base_forward):
+    mlp = make_mlp()
+    x = torch.randn(2, 37, HIDDEN, device="cuda", requires_grad=True)
+    assert rc._reject_reason(mlp, x) is None
+
+    state = mlp.down_proj.weight.quant_state
+    state.quant_type = "fp4"
+    try:
+        assert "nf4" in rc._reject_reason(mlp, x)
+    finally:
+        state.quant_type = "nf4"
+
+    packed = mlp.gate_proj.weight
+    plain = torch.nn.Parameter(packed.data.clone(), requires_grad=False)
+    plain.quant_state = packed.quant_state
+    mlp.gate_proj.weight = plain
+    try:
+        assert "Params4bit" in rc._reject_reason(mlp, x)
+    finally:
+        mlp.gate_proj.weight = packed
+    assert rc._reject_reason(mlp, x) is None
 
 
 @pytest.mark.parametrize("case", ["gelu", "plain_linear", "cpu"])
@@ -236,6 +322,7 @@ def test_unexpected_inputs_take_the_original_path(monkeypatch, case):
 
     monkeypatch.setattr(modeling_qwen2.Qwen2MLP, "forward", spy)
     monkeypatch.setattr(rc, "USE_MLP_RECOMPUTE", True)
+    monkeypatch.setattr(rc, "_warned", True)  # warning behaviour is tested elsewhere
     rc.patch_qwen2_mlp_recompute()
 
     if case == "cpu":
@@ -268,6 +355,19 @@ def test_patch_order_and_idempotence(monkeypatch):
     rc.patch_qwen2_mlp_recompute()
     assert getattr(modeling_qwen2.Qwen2MLP.forward.__wrapped__, k4._PATCH_MARK, False)
     assert modeling_qwen2.Qwen2MLP.forward.__wrapped__.__wrapped__ is base
+
+
+def test_module_has_no_kernels_and_no_banned_imports():
+    tree = ast.parse(Path(rc.__file__).read_text(encoding="utf-8"))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "triton" not in imported  # S4 adds no kernel and no compile time
+    assert not imported & {"unsloth", "liger_kernel", "xformers", "flash_attn", "torchao",
+                           "cut_cross_entropy"}
 
 
 def test_import_touches_no_cuda():

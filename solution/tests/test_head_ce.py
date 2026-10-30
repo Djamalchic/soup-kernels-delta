@@ -394,7 +394,10 @@ def test_model_guards_use_the_original(tiny_qwen, case):
     elif case == "tuple_output":
         kwargs["return_dict"] = False
     elif case == "logits_to_keep":
-        kwargs["logits_to_keep"] = 1
+        # Any logits_to_keep != 0 declines the fast path. Keep every position so that base itself
+        # can score the full labels (modeling_qwen2.py:464-469); a slice that drops positions makes
+        # base's ForCausalLMLoss fail, see test_model_logits_to_keep_slice_fails_like_the_original.
+        kwargs["logits_to_keep"] = batch["labels"].shape[1]
     elif case == "hooked_head":
         seen = []
         tiny_qwen.lm_head.register_forward_hook(lambda *a: seen.append(1))
@@ -410,6 +413,25 @@ def test_model_guards_use_the_original(tiny_qwen, case):
         assert holder.step is None
     if case == "hooked_head":
         assert seen
+    if case == "logits_to_keep":
+        assert logits.shape[:2] == batch["labels"].shape and out.loss is not None
+
+
+def test_model_logits_to_keep_slice_fails_like_the_original(tiny_qwen):
+    """logits_to_keep=1 with full labels: base keeps one position of logits
+    (modeling_qwen2.py:464-465) and ForCausalLMLoss flattens them against every shifted label
+    (loss_utils.py:67), so cross_entropy rejects the batch sizes (3 vs 120). Inside our scope the
+    guard must hand the call to the original, which fails the same way; no fused step is left."""
+    batch = model_batch(tiny_qwen.config.vocab_size)
+    messages = []
+    for scope in (_nullscope(), head_loss.fast_path_scope()):
+        with scope as holder, torch.autocast("cuda", dtype=torch.float16):
+            with pytest.raises(ValueError) as info:
+                tiny_qwen(**batch, use_cache=False, logits_to_keep=1)
+        messages.append(str(info.value))
+        if holder is not None:
+            assert holder.step is None
+    assert messages[0] == messages[1] and "batch_size" in messages[0]
 
 
 @pytest.mark.parametrize("extra", [{"ignore_index": -100}, {"shift_labels": None}])
@@ -496,7 +518,15 @@ def test_trainer_fast_path_matches_trl(tiny_qwen):
     mb, mo = base_t._metrics["train"], ours_t._metrics["train"]
     assert list(mb) == list(mo) == ["entropy", "num_tokens", "mean_token_accuracy"]
     assert mo["num_tokens"] == mb["num_tokens"] == [int(batch["attention_mask"].sum())]
-    assert rel(mo["entropy"][0], mb["entropy"][0]) <= 1e-4
+    # Both entropies are fp32 from the same fp16 logits, TRL's as -sum(p * log_softmax)
+    # (trl/trainer/utils.py:601-602), ours as log s - u / s. Each carries the rounding of log(s),
+    # s = sum exp(z - max) >= 1: with peaked logits (this model) s is just above 1 and the token
+    # entropy is ~1e-5, so that absolute error (at most ~log2(V) = 12 half-ulps of 1 per formula)
+    # dominates and a relative bound means nothing. Relative 1e-4 for ordinary entropies plus
+    # 16 fp32 eps absolute (1.9e-6) for the near-zero ones. The per-token formula itself is held
+    # to 1e-4 on exact logits in test_matches_base_exact; this checks the metric's wiring.
+    assert abs(mo["entropy"][0] - mb["entropy"][0]) <= \
+        1e-4 * abs(mb["entropy"][0]) + 16 * torch.finfo(torch.float32).eps
     labelled = int(num_items)
     assert abs(mo["mean_token_accuracy"][0] - mb["mean_token_accuracy"][0]) <= 1.0 / labelled + 1e-7
 

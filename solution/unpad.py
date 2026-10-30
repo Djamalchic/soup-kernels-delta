@@ -1,46 +1,50 @@
-"""U: unpadding inside each batch for the token-wise half of every Qwen2 decoder layer.
+"""U: run the token-wise half of every Qwen2 decoder layer on the real (unpadded) rows only.
 
-TRL's collator right-pads every batch to its longest row, so at batch 4 roughly 40-47 % of the
-[B, T] positions are padding [estimate, docs/UNPAD_DESIGN.md section 1]. RMSNorm, the residual
-adds and the MLP work row by row, so on the fast path they run on the N real rows only ([N, C]).
-Attention keeps the exact base shapes ([B, T, C] in, [B, T, C] out): q/k/v/o, LoRA dropout, RoPE,
-the causal+padding mask and SDPA see the same tensors shapes in the same call order as base, so
-the LoRA dropout masks and the CUDA RNG offsets are identical to base (see NOTES.md).
+TRL's collator right-pads every batch to its longest row (trl/trainer/sft_trainer.py:182, 215-217),
+so at batch 4 roughly 40-47 % of the [B, T] positions are padding [estimate, UNPAD_DESIGN.md s.1].
+RMSNorm, the residual adds and the MLP work row by row, so on the fast path they run on the N real
+rows ([N, C]). Attention keeps the exact base shapes ([B, T, C] in and out): q/k/v/o, LoRA dropout,
+RoPE, the causal+padding mask and SDPA see tensors of the base shape in the base call order, so
+the LoRA dropout masks and the CUDA Philox offsets are identical to base.
 
 One guarded class-level patch: `Qwen2Model.forward` (transformers 5.16.1,
-models/qwen2/modeling_qwen2.py:339-402). The fast path rebuilds lines 352-402 for the training
-case and assembles each layer from its submodules (the body of Qwen2DecoderLayer.forward,
-lines 269-298), called as modules so their own patches and hooks still apply:
-- input_layernorm / post_attention_layernorm / model.norm -> Qwen2RMSNorm (K3 rmsnorm if patched);
-- self_attn on [B, T, C] (zeros on padding rows), output gathered back to [N, C];
-- first residual add + post_attention_layernorm -> K3's fused add_rmsnorm when K3's decoder-layer
-  patch is installed, otherwise `r + a` and the norm module, exactly like base line 291 + 295;
-- mlp on [N, C] -> K4 (fp16 MLP through K1) when its guard passes;
+models/qwen2/modeling_qwen2.py:339-402). The fast path rebuilds lines 352-402 for the training case
+and assembles each layer from its submodules (the body of Qwen2DecoderLayer.forward, lines
+279-298), all called as modules, so their own class patches (K3 rmsnorm, K4 MLP, S4 inside the
+MLP) and hooks still apply:
+- input_layernorm / post_attention_layernorm / model.norm on [N, C] (K3's rmsnorm when patched);
+- self_attn on [B, T, C] (zeros on the padding rows), its output gathered back to [N, C];
+- residual add + post_attention_layernorm -> K3's fused add_rmsnorm when K3's decoder-layer patch is
+  installed (same conditions K3 checks), otherwise `r + a` and the norm module (lines 291, 295);
+- mlp on [N, C] (K4 -> K1 when their guards pass; N >= 129 keeps bitsandbytes off its small-M GEMM);
 - last_hidden_state scattered back to [B, T, C] with zeros on padding, so the base head and K2
-  (which packs the real rows itself) work unchanged.
+  (which takes [B, T, C] and the mask) work unchanged.
 
-What the fast path skips of the decorators (lines 339-340), and why that is safe:
-- merge_with_config_defaults (utils/generic.py:1000-1077): only resolves `use_cache` from the config
-  (lines 1007-1046; we resolve it the same way and require it to be falsy) and injects `is_causal`
-  (lines 1049-1057; we require it absent); `debug_io` (line 1060) must be absent.
-- capture_outputs (utils/output_capturing.py:215-286): pops `return_dict` (line 234; we pop it too
-  and require it truthy) and records hidden states / attentions only when output_* is set
-  (lines 238-256; we require both falsy, read the same way: kwargs first, then the config).
+What the fast path reproduces of the two decorators (lines 339-340):
+- merge_with_config_defaults (utils/generic.py:1000-1077): use_cache is resolved the same way
+  (lines 1019-1033) and must be falsy; `is_causal` (lines 1049-1057) and `debug_io` (line 1060) must
+  be absent.
+- capture_outputs (utils/output_capturing.py:215-286): `return_dict` is popped (line 234) and must not
+  be False (line 281); output_hidden_states / output_attentions are read as at lines 238-241 and must
+  be falsy; the output collector is set to an empty dict around the body exactly as at lines 253-265,
+  so transformers' installed-but-idle capture hooks (lines 105-110) behave as in base.
 Everything else goes to the untouched original, which keeps both decorators.
 
-Guards (types and shapes only, never the environment): training with grad enabled, exact
-Qwen2Model / Qwen2DecoderLayer types, no gradient checkpointing, SDPA, full attention only, no
-sliding layers, CUDA int input_ids [B, T] with a 2D int/bool attention_mask of the same shape, no
-inputs_embeds / position_ids / past_key_values / cache, no module hooks on the decoder layers we
-bypass (accelerate puts an instance-level `forward` there only for multi-device maps,
-accelerate/big_modeling.py:363-375), no global module hooks, and enough padding to pay for the
-scatter/gather. The decoder-layer forward must be the original or K3's patch of it (marker
-`_soup_delta_addnorm`); any other patch of that class keeps the original model forward. Guard
-evaluation never raises (Soup's tests pass fake modules): any exception means the original.
+Guards (types, shapes and values only, never the environment): training with grad enabled; exact
+Qwen2Model / Qwen2DecoderLayer / Qwen2RMSNorm types; the decoder-layer forward is the genuine one
+or K3's patch of it; no gradient checkpointing; SDPA; attention_dropout == 0; full attention only;
+CUDA int input_ids [B, T] on the embedding's device; a 2D bool/int attention_mask of the same shape
+that is binary, right-padded and has no empty row (checked on the device and folded into the one
+`nonzero`, idea from the GPT-6-Astra variant); no inputs_embeds / position_ids / past_key_values /
+cache; no hooks or instance-level forward on the decoder layers we bypass except transformers' own
+idle output-capture hooks; no global module hooks; no active dropout inside the MLP (LoRA on MLP
+projections would draw RNG on N rows); N >= 129 and at least 1/32 of the rows padding. Any exception
+while guards run means the original (Soup's tests pass fake modules); nothing is retried once
+attention may have consumed RNG.
 
-No Triton kernel here (the gather/scatter are torch index ops); nothing runs on CUDA at import or
-patch time. Idea credit: removing padding for token-wise ops as in ByteDance's Effective
-Transformer and the "unpad" path of FlashAttention's varlen BERT; code written from scratch.
+No Triton kernel here (gather/scatter are torch index ops); nothing runs on CUDA at import or patch
+time. Idea credit: removing padding for token-wise ops as in ByteDance's Effective Transformer and
+the "unpad" path of FlashAttention's varlen BERT; code written from scratch.
 """
 
 import functools
@@ -52,13 +56,15 @@ USE_UNPAD = False  # read by solution.apply(); False keeps the base Qwen2Model.f
 _MARK = "_soup_delta_unpad"
 _K3_MARK = "_soup_delta_addnorm"  # = solution/layers.py _MARK (K3)
 
-# Below 129 real rows bitsandbytes on a T4 runs gate/up (and down) through its own small-M GEMM
-# instead of dequant + F.linear (bitsandbytes/backends/cuda/ops.py:703-708; M = A.numel() // K at
-# line 948), so the MLP would leave K1's path. Such batches keep the original forward.
+# At M <= 128 bitsandbytes on a T4 (sm75) runs gate/up through its own small-M GEMM, and down at
+# M <= 64 (bitsandbytes/backends/cuda/ops.py:703-709; M = A.numel() // K at :947-948), i.e. not
+# through K1's dequant + F.linear. Such batches keep the original forward.
 _MIN_N = 129
-# Fewer than rows / 32 padding rows (~3 %): the scatter/gather traffic (~40 MB per layer at 2048
-# rows) is not paid back by the MLP work saved [estimate], so keep the exact original.
+# Fewer than rows / 32 padding rows (~3 %): the scatter/gather traffic is not paid back by the MLP
+# work saved [estimate], so keep the exact original.
 _MIN_PAD_DIV = 32
+
+_HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
 
 # Calls that took each path. Python ints only; tests and a debug notebook read them.
 COUNTS = {"packed": 0, "original": 0}
@@ -73,7 +79,7 @@ _REFS = {}
 # ---------------------------------------------------------------------------------------------
 
 class _PackRows(torch.autograd.Function):
-    """[rows, C] -> [N, C] = x[idx]. Backward scatters the gradient into zeros (idx is unique)."""
+    """[rows, C] -> [N, C] = x[idx]. Backward copies the gradient into zeros (idx is unique)."""
 
     @staticmethod
     def forward(ctx, x2, idx):
@@ -115,15 +121,63 @@ def unpack_rows(x, idx, batch, seq):
     return _UnpackRows.apply(x, idx, batch * seq).view(batch, seq, x.shape[-1])
 
 
+def _row_indices(attention_mask):
+    """Flat indices of the real rows, or None when the batch does not qualify.
+
+    The mask must be binary, right-padded (TRL's collator) and have a real first token in every
+    row. The check stays on the device and gates the mask, so a bad mask makes `nonzero` return
+    nothing instead of costing a second host sync (idea: GPT-6-Astra variant). Reads only.
+    """
+    keep = attention_mask.eq(1)
+    valid = (
+        (keep | attention_mask.eq(0)).all()          # binary
+        & keep[:, 0].all()                           # no empty row
+        & (keep[:, :-1] | ~keep[:, 1:]).all()        # right-padded: keep[t] implies keep[t-1]
+    )
+    idx = (keep & valid).reshape(-1).nonzero().view(-1)
+    rows = keep.numel()
+    n_real = idx.numel()  # the only host sync U adds: N is a shape
+    if n_real < _MIN_N or (rows - n_real) * _MIN_PAD_DIV < rows:
+        return None
+    return idx
+
+
 # ---------------------------------------------------------------------------------------------
 # Guards
 # ---------------------------------------------------------------------------------------------
 
-def _no_hooks(module):
-    for name in ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks"):
+def _hookless(module):
+    for name in _HOOK_DICTS:
         if getattr(module, name, None):
             return False
     return "forward" not in module.__dict__  # instance-level forward (accelerate's add_hook_to_module)
+
+
+def _is_capture_hook(fn):
+    """transformers' output-capturing hook (utils/output_capturing.py:100-119). It only appends to
+    the active collector and returns None; with an empty collector it returns at once (:105-110)."""
+    qualname = _REFS.get("capture_qualname")
+    return (qualname is not None
+            and getattr(fn, "__module__", None) == _REFS.get("capture_module")
+            and getattr(fn, "__qualname__", None) == qualname)
+
+
+def _bypassed_layer_ok(layer):
+    """We never call the decoder layer itself, so it must carry nothing that would run around it,
+    except transformers' idle capture hooks (output_* is required falsy, see _fast_path_ok)."""
+    if "forward" in layer.__dict__:
+        return False
+    for name in ("_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks"):
+        if getattr(layer, name, None):
+            return False
+    hooks = getattr(layer, "_forward_hooks", None)
+    if hooks:
+        if getattr(layer, "_forward_hooks_with_kwargs", None) or getattr(
+                layer, "_forward_hooks_always_called", None):
+            return False
+        if not all(_is_capture_hook(h) for h in hooks.values()):
+            return False
+    return True
 
 
 def _no_global_hooks():
@@ -135,18 +189,31 @@ def _no_global_hooks():
     return True
 
 
+def _rowwise_parts_ok(layer, norm_cls):
+    """The parts we run on [N, C] must be row-wise and draw no random numbers."""
+    if type(layer.input_layernorm) is not norm_cls or type(layer.post_attention_layernorm) is not norm_cls:
+        return False
+    for m in layer.mlp.modules():
+        if isinstance(m, torch.nn.Dropout) and m.training and m.p > 0:
+            return False  # e.g. LoRA on gate/up/down: its dropout would draw on N rows, not B*T
+    return True
+
+
 def _layer_mode(layer_forward):
-    """'plain' for the original Qwen2DecoderLayer.forward, 'k3' for K3's patch of it, else None."""
-    original = _REFS["layer_forward"]
-    if layer_forward is original:
+    """'plain' for the genuine Qwen2DecoderLayer.forward, 'k3' for K3's patch of it, else None."""
+    genuine = _REFS.get("layer_forward")
+    if genuine is None:
+        return None
+    if layer_forward is genuine:
         return "plain"
-    if getattr(layer_forward, _K3_MARK, False) and getattr(layer_forward, "__wrapped__", None) is original:
+    if getattr(layer_forward, _K3_MARK, False) and getattr(layer_forward, "__wrapped__", None) is genuine:
         return "k3"
     return None
 
 
 def _resolve_use_cache(model, use_cache):
-    # merge_with_config_defaults, utils/generic.py:1019-1046: an explicit value wins, else the config.
+    # merge_with_config_defaults, utils/generic.py:1019-1033: an explicit value wins, else the config;
+    # gradient checkpointing in training turns a truthy value off.
     value = use_cache if use_cache is not None else getattr(model.config, "use_cache", None)
     if value and getattr(model, "gradient_checkpointing", False) and model.training:
         value = False
@@ -155,7 +222,8 @@ def _resolve_use_cache(model, use_cache):
 
 def _fast_path_ok(model, input_ids, attention_mask, position_ids, past_key_values, inputs_embeds,
                   use_cache, kwargs):
-    """Returns the layer mode ('plain' or 'k3') when the fast path reproduces base, else None."""
+    """The layer mode ('plain' or 'k3') when the fast path reproduces base, else None.
+    `use_cache` is the already resolved value. Reads only; never touches CUDA memory."""
     if type(model) is not _REFS["model_cls"]:
         return None
     if not model.training or not torch.is_grad_enabled():
@@ -166,7 +234,7 @@ def _fast_path_ok(model, input_ids, attention_mask, position_ids, past_key_value
         return None
     if not isinstance(input_ids, torch.Tensor) or not isinstance(attention_mask, torch.Tensor):
         return None  # a dict mask (line 367) or no mask goes to the original
-    if input_ids.ndim != 2 or not input_ids.is_cuda or input_ids.is_floating_point():
+    if input_ids.ndim != 2 or not input_ids.is_cuda or input_ids.dtype not in (torch.int64, torch.int32):
         return None
     if attention_mask.shape != input_ids.shape or attention_mask.device != input_ids.device:
         return None
@@ -174,15 +242,17 @@ def _fast_path_ok(model, input_ids, attention_mask, position_ids, past_key_value
         return None
     if input_ids.numel() == 0:
         return None
-    if _resolve_use_cache(model, use_cache):
-        return None  # base would build a DynamicCache (line 358-359) and return it
+    if use_cache:
+        return None  # base would build a DynamicCache (lines 358-359) and return it
+    if model.embed_tokens.weight.device != input_ids.device:
+        return None
 
     config = model.config
     if "is_causal" in kwargs or hasattr(config, "is_causal"):
         return None  # merge_with_config_defaults would rewrite the config (generic.py:1049-1057)
     if kwargs.get("debug_io", False):
         return None
-    # capture_outputs reads these exactly so (output_capturing.py:238-242).
+    # capture_outputs reads these exactly so (output_capturing.py:238-241).
     for key in ("output_hidden_states", "output_attentions"):
         if kwargs.get(key, getattr(config, key, False)):
             return None
@@ -191,6 +261,8 @@ def _fast_path_ok(model, input_ids, attention_mask, position_ids, past_key_value
 
     if getattr(config, "_attn_implementation", None) != "sdpa":
         return None
+    if getattr(config, "attention_dropout", 0.0) != 0.0:
+        return None  # SDPA dropout (modeling_qwen2.py:226); Qwen2Config default 0.0 (configuration_qwen2.py:78)
     if getattr(model, "has_sliding_layers", True):
         return None
     n_layers = config.num_hidden_layers
@@ -202,26 +274,45 @@ def _fast_path_ok(model, input_ids, attention_mask, position_ids, past_key_value
     layers = model.layers[:n_layers]
     if len(layers) != n_layers or not _no_global_hooks():
         return None
+    norm_cls = _REFS["norm_cls"]
+    if type(model.norm) is not norm_cls:
+        return None
     layer_cls = _REFS["layer_cls"]
     for layer in layers:
         if type(layer) is not layer_cls or getattr(layer, "gradient_checkpointing", True):
             return None
-        if not _no_hooks(layer):
+        if not _bypassed_layer_ok(layer) or not _rowwise_parts_ok(layer, norm_cls):
             return None
     return _layer_mode(layer_cls.forward)
 
 
+# ---------------------------------------------------------------------------------------------
+# K3 hand-off: the public kernel entry points, with the contract its docstring states
+# (solution/kernels/addnorm.py add_rmsnorm: caller checks norm_ok and that delta is a CUDA
+# fp16/fp32 tensor of residual's shape and device; solution/layers.py also requires a plain norm).
+# ---------------------------------------------------------------------------------------------
+
 def _k3_ops():
-    """(add_rmsnorm, norm_ok, plain_norm_module, delta_ok) from K3, or None if K3 is not merged."""
+    """(add_rmsnorm, norm_ok) from K3, or None if K3 is not merged."""
     if "k3" not in _REFS:
         try:
             from .kernels.addnorm import add_rmsnorm, norm_ok
-            from .layers import _delta_ok, _plain_norm_module
 
-            _REFS["k3"] = (add_rmsnorm, norm_ok, _plain_norm_module, _delta_ok)
+            _REFS["k3"] = (add_rmsnorm, norm_ok)
         except Exception:  # noqa: BLE001 - without K3 the unfused reference ops run
             _REFS["k3"] = None
     return _REFS["k3"]
+
+
+def _plain_norm(module):
+    # We call the kernel instead of module(...), so nothing may run around the module call.
+    return (type(module) is _REFS["norm_cls"] and _hookless(module)
+            and isinstance(getattr(module, "variance_epsilon", None), float))
+
+
+def _delta_ok(residual, delta):
+    return (delta.is_cuda and delta.device == residual.device
+            and delta.dtype in (torch.float16, torch.float32) and delta.shape == residual.shape)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -231,7 +322,7 @@ def _k3_ops():
 def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3):
     """One decoder layer, modeling_qwen2.py:279-298, with the token-wise ops on [N, C]."""
     x = layer.input_layernorm(r)  # line 280, row-wise
-    a_bt, _ = layer.self_attn(  # lines 282-290: same arguments, base shapes
+    a_bt, _ = layer.self_attn(  # lines 282-290: the same arguments and kwargs, base shapes
         hidden_states=unpack_rows(x, idx, batch, seq),
         attention_mask=mask,
         position_ids=pos_ids,
@@ -241,47 +332,47 @@ def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, 
         **kwargs,
     )
     a = pack_rows(a_bt, idx)
+    del a_bt
     ln2 = layer.post_attention_layernorm
     if k3 is not None:
-        add_rmsnorm, norm_ok, plain_norm_module, delta_ok = k3
-        # The same conditions as K3's own layer patch (solution/layers.py), on [N, C].
-        if (plain_norm_module(ln2, _REFS["norm_cls"]) and norm_ok(r, getattr(ln2, "weight", None))
-                and delta_ok(r, a)):
-            r, y = add_rmsnorm(r, a, ln2.weight, ln2.variance_epsilon)
-            return r + layer.mlp(y)  # lines 296-298
+        add_rmsnorm, norm_ok = k3
+        weight = getattr(ln2, "weight", None)
+        # The conditions of K3's own layer patch (solution/layers.py), on [N, C].
+        if _plain_norm(ln2) and norm_ok(r, weight) and _delta_ok(r, a):
+            r, y = add_rmsnorm(r, a, weight, ln2.variance_epsilon)
+            return r + layer.mlp(y)  # lines 296-297
     r = r + a  # line 291: fp32 + fp16 -> fp32, the same elementwise values as base
-    return r + layer.mlp(ln2(r))  # lines 294-298
+    return r + layer.mlp(ln2(r))  # lines 294-297
 
 
-def _packed_forward(model, input_ids, attention_mask, use_cache, kwargs, mode):
-    """modeling_qwen2.py:352-402 for the guarded training case. Returns None (nothing computed
-    yet) when the batch does not qualify."""
+def _packed_forward(model, input_ids, attention_mask, idx, use_cache, kwargs, mode):
+    """modeling_qwen2.py:352-402 for the guarded training case."""
     batch, seq = input_ids.shape
-    rows = batch * seq
-    # The only host sync U adds: N is a shape.
-    idx = attention_mask.reshape(-1).nonzero().view(-1)
-    n_real = idx.numel()
-    if n_real < _MIN_N or (rows - n_real) * _MIN_PAD_DIV < rows:
-        return None
-
     mq = _REFS["modeling"]
-    embeds = model.embed_tokens(input_ids)  # line 356
-    pos_ids = torch.arange(seq, device=embeds.device).unsqueeze(0)  # lines 361-364, no cache
-    mask = mq.create_causal_mask(  # lines 369-378, the same module-level function as base
-        config=model.config,
-        inputs_embeds=embeds,
-        attention_mask=attention_mask,
-        past_key_values=None,
-        position_ids=pos_ids,
-    )
-    pos_emb = model.rotary_emb(embeds, pos_ids)  # line 385 (cos/sin in the embeddings' dtype)
-    r = pack_rows(embeds, idx)
-    del embeds
+    collector = _REFS.get("collector")
+    # capture_outputs sets the collector to {} when nothing is requested (output_capturing.py:253-258)
+    token = collector.set({}) if collector is not None else None
+    try:
+        embeds = model.embed_tokens(input_ids)  # line 356
+        pos_ids = torch.arange(seq, device=embeds.device).unsqueeze(0)  # lines 361-364, no cache
+        mask = mq.create_causal_mask(  # lines 369-378, the same module-level function as base
+            config=model.config,
+            inputs_embeds=embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            position_ids=pos_ids,
+        )
+        pos_emb = model.rotary_emb(embeds, pos_ids)  # line 385 (cos/sin in the embeddings' dtype)
+        r = pack_rows(embeds, idx)
+        del embeds
 
-    k3 = _k3_ops() if mode == "k3" else None
-    for layer in model.layers[: model.config.num_hidden_layers]:  # line 387
-        r = _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3)
-    hidden = model.norm(r)  # line 398, row-wise
+        k3 = _k3_ops() if mode == "k3" else None
+        for layer in model.layers[: model.config.num_hidden_layers]:  # line 387
+            r = _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3)
+        hidden = model.norm(r)  # line 398, row-wise
+    finally:
+        if collector is not None:
+            collector.reset(token)  # output_capturing.py:265
     return mq.BaseModelOutputWithPast(  # lines 399-402; use_cache is falsy here
         last_hidden_state=unpack_rows(hidden, idx, batch, seq),
         past_key_values=None,
@@ -290,29 +381,38 @@ def _packed_forward(model, input_ids, attention_mask, use_cache, kwargs, mode):
 
 def forward_impl(original, model, input_ids=None, attention_mask=None, position_ids=None,
                  past_key_values=None, inputs_embeds=None, use_cache=None, **kwargs):
+    idx = None
     try:
+        resolved = _resolve_use_cache(model, use_cache)
         mode = _fast_path_ok(model, input_ids, attention_mask, position_ids, past_key_values,
-                             inputs_embeds, use_cache, kwargs)
+                             inputs_embeds, resolved, kwargs)
+        if mode is not None:
+            idx = _row_indices(attention_mask)  # reads the mask only; no module ran yet
     except Exception:  # noqa: BLE001 - an unexpected object is never ours to handle
-        mode = None
-    out = None
-    if mode is not None:
-        kw = dict(kwargs)
-        kw.pop("return_dict", None)  # capture_outputs pops it before the body (line 234)
-        # merge_with_config_defaults hands the body the resolved value (generic.py:1043-1046).
-        resolved = use_cache if use_cache is not None else getattr(model.config, "use_cache", None)
-        out = _packed_forward(model, input_ids, attention_mask, resolved, kw, mode)
-    if out is not None:
-        COUNTS["packed"] += 1
-        return out
-    COUNTS["original"] += 1
-    return original(model, input_ids=input_ids, attention_mask=attention_mask,
-                    position_ids=position_ids, past_key_values=past_key_values,
-                    inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+        idx = None
+    if idx is None:
+        COUNTS["original"] += 1
+        return original(model, input_ids=input_ids, attention_mask=attention_mask,
+                        position_ids=position_ids, past_key_values=past_key_values,
+                        inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+    kw = dict(kwargs)
+    kw.pop("return_dict", None)  # capture_outputs pops it before the body (output_capturing.py:234)
+    # No try from here on: once attention ran, a retry would draw the dropout masks twice.
+    out = _packed_forward(model, input_ids, attention_mask, idx, resolved, kw, mode)
+    COUNTS["packed"] += 1
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Installation
+# ---------------------------------------------------------------------------------------------
+
+def _is_genuine(fn, module_name, qualname):
+    return getattr(fn, "__module__", None) == module_name and getattr(fn, "__qualname__", None) == qualname
 
 
 def _innermost_layer_forward(fn):
-    # K3 keeps the original in __wrapped__ (solution/layers.py); unwrap our own kind of patches only.
+    # K3 keeps the original in __wrapped__ (solution/layers.py); unwrap only K3's marked patches.
     while getattr(fn, _K3_MARK, False) and getattr(fn, "__wrapped__", None) is not None:
         fn = fn.__wrapped__
     return fn
@@ -331,12 +431,33 @@ def patch_qwen2_model_unpad():
     current = model_cls.forward
     if getattr(current, _MARK, False):
         return True
-    _REFS.update(modeling=mq, model_cls=model_cls, layer_cls=layer_cls, norm_cls=norm_cls,
-                 layer_forward=_innermost_layer_forward(layer_cls.forward))
+    # Wrap only the genuine (decorated) forward: functools.wraps in both decorators keeps this
+    # module and qualname (generic.py:1006, output_capturing.py:231). Someone else's replacement
+    # would be bypassed by the fast path, so then we do not install at all.
+    if not _is_genuine(current, mq.__name__, "Qwen2Model.forward"):
+        return False
+
+    layer_forward = _innermost_layer_forward(layer_cls.forward)
+    refs = dict(modeling=mq, model_cls=model_cls, layer_cls=layer_cls, norm_cls=norm_cls,
+                layer_forward=(layer_forward if _is_genuine(layer_forward, mq.__name__,
+                                                            "Qwen2DecoderLayer.forward") else None))
+    try:
+        from transformers.utils import output_capturing as oc
+
+        refs["collector"] = oc._active_collector
+        refs["capture_module"] = oc.__name__
+        refs["capture_qualname"] = (oc.install_output_capuring_hook.__qualname__
+                                    + ".<locals>.output_capturing_hook")
+    except Exception:  # noqa: BLE001 - without them capture hooks keep the original path
+        for key in ("collector", "capture_module", "capture_qualname"):
+            refs.pop(key, None)
+    _REFS.clear()
+    _REFS.update(refs)
     original = current
 
     # functools.wraps keeps __wrapped__ = original, so inspect.signature still shows the original
-    # parameters; the original keeps its decorators for every call we do not take.
+    # parameters (Trainer reads them, trainer.py:499-505); the original keeps its decorators for
+    # every call we do not take.
     @functools.wraps(original)
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
                 inputs_embeds=None, use_cache=None, **kwargs):

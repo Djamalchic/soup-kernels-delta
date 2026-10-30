@@ -1,6 +1,7 @@
-"""U (solution/unpad.py): the unpadded Qwen2Model.forward matches base on the real rows, keeps the
-LoRA dropout masks and the CUDA RNG offsets identical, leaves anything unexpected on the original
-forward, and composes with K1/K3/K4 (decoder side) and K2 (head).
+"""U (solution/unpad.py): the unpadded Qwen2Model.forward matches base on the real rows, keeps every
+LoRA dropout mask and the CUDA RNG offsets identical, fires with the kwargs the Trainer really
+passes (num_items_in_batch), leaves anything unexpected on the original forward, and composes with
+K1/K3/K4 (decoder side, both install orders) and K2 (head).
 
 Run from the repository root on a T4: python -m pytest solution -q
 """
@@ -27,15 +28,19 @@ LENGTHS = (7, 150, 1, 90)  # a length-1 row and a full row; N = 248 >= 129, B*T 
 # Helpers
 # ---------------------------------------------------------------------------------------------
 
+def _unwrap_unpad(fn):
+    while getattr(fn, unpad._MARK, False):
+        fn = fn.__wrapped__
+    return fn
+
+
 @pytest.fixture
 def forwards(monkeypatch):
     """(base, patched) Qwen2Model.forward. Every class forward a test patches is restored after it."""
     for cls in (mq.Qwen2Model, mq.Qwen2DecoderLayer, mq.Qwen2RMSNorm, mq.Qwen2MLP,
                 mq.Qwen2ForCausalLM):
         monkeypatch.setattr(cls, "forward", cls.forward)
-    base = mq.Qwen2Model.forward
-    while getattr(base, unpad._MARK, False):
-        base = base.__wrapped__
+    base = _unwrap_unpad(mq.Qwen2Model.forward)
     mq.Qwen2Model.forward = base
     assert unpad.patch_qwen2_model_unpad()
     patched = mq.Qwen2Model.forward
@@ -89,34 +94,51 @@ def make_batch(vocab, lengths=LENGTHS, seq=SEQ, seed=1):
     return {"input_ids": input_ids.to(DEV), "attention_mask": mask.to(DEV), "labels": labels.to(DEV)}
 
 
-def run(pm, batch, forward, seed=1234, scope=None):
+def num_items(batch):
+    # What Trainer._get_num_items_in_batch hands to compute_loss: labelled targets after the shift.
+    return batch["labels"][..., 1:].ne(-100).sum()
+
+
+def run(pm, batch, forward, seed=1234, **extra):
     """One training forward + backward with a given Qwen2Model.forward. Records the final hidden
-    states, the RNG state before every LoRA dropout call and after the forward, the dropout masks
-    and the LoRA gradients."""
+    states, the RNG state before every LoRA dropout call and after the forward, the full keep-mask
+    of every dropout call (replayed on ones from the recorded state, idea from the GPT-6-Astra
+    variant) and the LoRA gradients."""
     mq.Qwen2Model.forward = forward
     pm.zero_grad(set_to_none=True)
-    rec = {"hidden": None, "rng_pre": [], "keep": [], "drop_in": []}
+    rec = {"hidden": None, "rng_pre": [], "drop": []}
+    pending = []
 
     # Every hook returns None, so no output is replaced.
     def on_model(module, args, output):
         rec["hidden"] = output.last_hidden_state.detach().clone()
 
     def before_dropout(module, args):
-        rec["rng_pre"].append(torch.cuda.get_rng_state())
+        state = torch.cuda.get_rng_state(args[0].device)
+        rec["rng_pre"].append(state)
+        pending.append(state)
 
     def after_dropout(module, args, output):
-        rec["keep"].append(output.detach() != 0)
-        rec["drop_in"].append(args[0].detach().clone())
+        x = args[0]
+        state = pending.pop()
+        # fork_rng restores the generator on exit, so the replay does not move the real forward.
+        with torch.random.fork_rng(devices=[x.device.index]):
+            torch.cuda.set_rng_state(state, x.device)
+            keep = torch.nn.functional.dropout(torch.ones_like(x), p=module.p, training=module.training).ne(0)
+        visible = x.ne(0)
+        assert torch.equal(output.ne(0)[visible], keep[visible])  # the replay is the real mask
+        rec["drop"].append({"shape": tuple(x.shape), "stride": x.stride(), "dtype": x.dtype,
+                            "keep": keep, "input": x.detach().clone()})
 
     hooks = [inner_model(pm).register_forward_hook(on_model)]
     for name, mod in pm.named_modules():
-        if name.endswith("lora_dropout.default"):
+        if isinstance(mod, torch.nn.Dropout) and name.endswith("lora_dropout.default"):
             hooks.append(mod.register_forward_pre_hook(before_dropout))
             hooks.append(mod.register_forward_hook(after_dropout))
     try:
         torch.manual_seed(seed)
         with torch.autocast("cuda", dtype=torch.float16):
-            out = pm(**batch, use_cache=False)
+            out = pm(**batch, use_cache=False, **extra)
         rng_after = torch.cuda.get_rng_state()
         out.loss.backward()
     finally:
@@ -136,7 +158,7 @@ def counts():
 
 
 # ---------------------------------------------------------------------------------------------
-# Row gather / scatter
+# Row gather / scatter and the mask check
 # ---------------------------------------------------------------------------------------------
 
 def test_pack_unpack_roundtrip_and_gradients():
@@ -171,6 +193,44 @@ def test_pack_unpack_roundtrip_and_gradients():
     assert torch.equal(torch.cuda.get_rng_state(), rng)  # no RNG use
 
 
+def _mask(lengths, seq=SEQ, dtype=torch.long):
+    m = torch.zeros(len(lengths), seq, dtype=torch.long, device=DEV)
+    for row, n in enumerate(lengths):
+        m[row, :n] = 1
+    return m.to(dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.long, torch.int32, torch.bool])
+def test_row_indices_accepts_right_padded_masks(dtype):
+    mask = _mask(LENGTHS, dtype=dtype)
+    copy = mask.clone()
+    idx = unpad._row_indices(mask)
+    assert idx is not None and idx.dtype == torch.int64
+    assert torch.equal(idx, _mask(LENGTHS).reshape(-1).nonzero().view(-1))
+    assert torch.equal(mask, copy)
+
+
+@pytest.mark.parametrize("case", ["left_padded", "non_binary", "hole", "empty_row", "no_padding",
+                                  "little_padding", "small_n"])
+def test_row_indices_rejects(case):
+    mask = _mask(LENGTHS)
+    if case == "left_padded":
+        mask = mask.flip(1)
+    elif case == "non_binary":
+        mask = mask * 2
+    elif case == "hole":
+        mask[1, 40] = 0  # a zero inside a row, ones after it
+    elif case == "empty_row":
+        mask[2, :] = 0
+    elif case == "no_padding":
+        mask = torch.ones_like(mask)
+    elif case == "little_padding":
+        mask = _mask((SEQ, SEQ, SEQ, SEQ - 10))  # 10 of 600 rows padding (< 1/32)
+    elif case == "small_n":
+        mask = _mask((5, 3, 1, 2), seq=5)  # N = 11 < 129: bitsandbytes' small-M GEMM territory
+    assert unpad._row_indices(mask) is None
+
+
 # ---------------------------------------------------------------------------------------------
 # Whole model against base
 # ---------------------------------------------------------------------------------------------
@@ -180,22 +240,22 @@ def check_against_base(pm, batch, base_run, new_run, loss_rtol=1e-4, grad_rtol=2
     loss1, rec1, rng1, grads1 = new_run
     real = batch["attention_mask"].bool()
 
-    # RNG: every LoRA dropout call starts from the same generator state, and the forward leaves
-    # the generator where base leaves it.
+    # RNG: every LoRA dropout call starts from the same generator state, sees an input of the same
+    # shape, stride and dtype, draws the same full keep-mask, and the forward leaves the generator
+    # where base leaves it.
     n_drop = 2 * pm.config.num_hidden_layers
     assert len(rec0["rng_pre"]) == len(rec1["rng_pre"]) == n_drop
     for s0, s1 in zip(rec0["rng_pre"], rec1["rng_pre"]):
         assert torch.equal(s0, s1)
     assert torch.equal(rng0, rng1)
-
-    # Dropout inputs keep the base shape [B, T, C]; on the real rows the masks are identical.
-    for k0, k1, i0, i1 in zip(rec0["keep"], rec1["keep"], rec0["drop_in"], rec1["drop_in"]):
-        assert k0.shape == k1.shape == i0.shape == i1.shape
-        nz = (i0 != 0) & (i1 != 0) & real[..., None]
-        assert torch.equal(k0[nz], k1[nz])
-        assert (i1[~real] == 0).all()  # our attention input is zero on padding
+    for d0, d1 in zip(rec0["drop"], rec1["drop"], strict=True):
+        for key in ("shape", "stride", "dtype"):
+            assert d0[key] == d1[key], key
+        assert d1["shape"] == tuple(batch["input_ids"].shape) + (pm.config.hidden_size,)
+        assert torch.equal(d0["keep"], d1["keep"])
+        assert (d1["input"][~real] == 0).all()  # our attention input is zero on padding
     # Layer 0 q_proj input: the same values on the real rows (row-wise norm on [N, C]).
-    torch.testing.assert_close(rec1["drop_in"][0][real], rec0["drop_in"][0][real],
+    torch.testing.assert_close(rec1["drop"][0]["input"][real], rec0["drop"][0]["input"][real],
                                rtol=1e-6, atol=1e-6)
 
     # Final hidden states: close on the real rows, exact zeros on padding.
@@ -223,19 +283,60 @@ def test_matches_base_loss_grads_and_rng(forwards):
     check_against_base(pm, batch, base_run, new_run)
 
 
+def test_trainer_kwargs_take_the_fast_path(forwards):
+    """Trainer.compute_loss adds num_items_in_batch to the model inputs (trainer.py:2009-2014), and
+    Qwen2ForCausalLM forwards it to Qwen2Model (modeling_qwen2.py:452-460); PEFT passes
+    output_attentions / output_hidden_states / return_dict as None (peft_model.py:2101-2110).
+    None of them may switch U off."""
+    base, patched = forwards
+    pm = build()
+    batch = make_batch(pm.config.vocab_size)
+    extra = {"num_items_in_batch": num_items(batch)}
+    base_run = run(pm, batch, base, **extra)
+    before = counts()
+    new_run = run(pm, batch, patched, **extra)
+    assert counts()["packed"] == before["packed"] + 1 and counts()["original"] == before["original"]
+    check_against_base(pm, batch, base_run, new_run)
+
+
+def test_idle_capture_hooks_keep_the_fast_path(forwards):
+    """One output_hidden_states=True call installs transformers' capture hooks on every decoder
+    layer and attention module (output_capturing.py:196-212); they stay idle afterwards."""
+    base, patched = forwards
+    pm = build()
+    model = inner_model(pm)
+    batch = make_batch(pm.config.vocab_size)
+    mq.Qwen2Model.forward = patched
+    before = counts()
+    with torch.autocast("cuda", dtype=torch.float16):
+        out = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+                    use_cache=False, output_hidden_states=True)
+    assert counts()["original"] == before["original"] + 1  # collection requested: original
+    assert len(out.hidden_states) == pm.config.num_hidden_layers + 1
+    assert all(len(layer._forward_hooks) > 0 for layer in model.layers)
+
+    base_run = run(pm, batch, base)
+    before = counts()
+    new_run = run(pm, batch, patched)
+    assert counts()["packed"] == before["packed"] + 1
+    check_against_base(pm, batch, base_run, new_run)
+
+
 def test_inputs_are_not_mutated(forwards):
     _, patched = forwards
     pm = build()
     batch = make_batch(pm.config.vocab_size)
     copies = {k: v.clone() for k, v in batch.items()}
-    run(pm, batch, patched)
+    before = counts()
+    run(pm, batch, patched, num_items_in_batch=num_items(batch))
+    assert counts()["packed"] == before["packed"] + 1
     for k in batch:
         assert torch.equal(batch[k], copies[k]), k
 
 
 @pytest.mark.parametrize("lengths,seq", [
     ((SEQ,) * 4, SEQ),  # no padding: N == B*T
-    ((5, 3, 1, 2), 5),  # N = 11 < 129: bitsandbytes' small-M GEMM territory
+    ((5, 3, 1, 2), 5),  # N = 11 < 129
     ((SEQ, SEQ, SEQ, SEQ - 10), SEQ),  # 10 of 600 rows padding (< 1/32)
 ])
 def test_batches_without_enough_padding_use_the_original(forwards, lengths, seq):
@@ -255,9 +356,11 @@ def test_batches_without_enough_padding_use_the_original(forwards, lengths, seq)
 # ---------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("case", [
-    "eval", "no_grad", "output_hidden_states", "use_cache", "config_use_cache", "no_mask",
-    "inputs_embeds", "position_ids", "tuple_output", "gradient_checkpointing", "is_causal",
-    "hooked_layer", "unknown_layer_patch", "global_hook", "cpu"])
+    "eval", "no_grad", "output_hidden_states", "output_attentions_config", "use_cache",
+    "config_use_cache", "no_mask", "inputs_embeds", "position_ids", "tuple_output",
+    "gradient_checkpointing", "is_causal", "hooked_layer", "unknown_layer_patch", "global_hook",
+    "cpu", "left_padding", "non_binary_mask", "attention_dropout", "dropout_in_mlp",
+    "eager_attention"])
 def test_guards_use_the_original(forwards, monkeypatch, case):
     _, patched = forwards
     mq.Qwen2Model.forward = patched
@@ -265,7 +368,7 @@ def test_guards_use_the_original(forwards, monkeypatch, case):
     model = inner_model(pm)
     batch = make_batch(pm.config.vocab_size)
     kwargs = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"],
-              "use_cache": False}
+              "use_cache": False, "num_items_in_batch": num_items(batch)}
     grad_ctx = torch.enable_grad()
     handle = None
     if case == "eval":
@@ -274,6 +377,8 @@ def test_guards_use_the_original(forwards, monkeypatch, case):
         grad_ctx = torch.no_grad()
     elif case == "output_hidden_states":
         kwargs["output_hidden_states"] = True
+    elif case == "output_attentions_config":
+        monkeypatch.setattr(model.config, "_output_attentions", True)  # property backing field
     elif case == "use_cache":
         kwargs["use_cache"] = True
     elif case == "config_use_cache":
@@ -305,6 +410,17 @@ def test_guards_use_the_original(forwards, monkeypatch, case):
     elif case == "cpu":
         pm.to("cpu")
         kwargs = {k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in kwargs.items()}
+    elif case == "left_padding":
+        kwargs["input_ids"] = kwargs["input_ids"].flip(1)
+        kwargs["attention_mask"] = kwargs["attention_mask"].flip(1)
+    elif case == "non_binary_mask":
+        kwargs["attention_mask"] = kwargs["attention_mask"] * 2
+    elif case == "attention_dropout":
+        monkeypatch.setattr(model.config, "attention_dropout", 0.1)
+    elif case == "dropout_in_mlp":
+        model.layers[1].mlp.extra_dropout = torch.nn.Dropout(0.1)  # as LoRA on an MLP projection
+    elif case == "eager_attention":
+        monkeypatch.setattr(model.config, "_attn_implementation_internal", "eager")
 
     before = counts()
     try:
@@ -335,18 +451,32 @@ def test_fake_objects_go_to_the_original():
     assert out[0] == "original" and out[1] is mask
 
 
+def test_foreign_model_forward_is_not_wrapped(monkeypatch):
+    """A replacement of Qwen2Model.forward we do not know would be bypassed: do not install."""
+    monkeypatch.setattr(mq.Qwen2Model, "forward", mq.Qwen2Model.forward)
+    base = _unwrap_unpad(mq.Qwen2Model.forward)
+
+    def foreign(self, *a, **k):
+        return base(self, *a, **k)
+
+    mq.Qwen2Model.forward = foreign
+    assert unpad.patch_qwen2_model_unpad() is False
+    assert mq.Qwen2Model.forward is foreign
+
+
 # ---------------------------------------------------------------------------------------------
 # Composition with the other patches
 # ---------------------------------------------------------------------------------------------
 
-def test_composes_with_k1_k3_k4(forwards, monkeypatch):
+@pytest.mark.parametrize("order", ["u_then_k3", "k3_then_u"])
+def test_composes_with_k1_k3_k4(forwards, monkeypatch, order):
     """Real widths (hidden 1536, 12 heads of 128, intermediate 8960), so K3's norm_ok and
-    bitsandbytes' T4 routing (ops.py:703-708) are the production ones. Both runs use the same
-    K1/K3/K4 patches; only Qwen2Model.forward differs."""
+    bitsandbytes' T4 routing (ops.py:703-709) are the production ones. Both runs use the same
+    K1/K3/K4 patches; only Qwen2Model.forward differs. U is installed before or after K3."""
     bnb = pytest.importorskip("bitsandbytes")
     import solution.mlp as k4
 
-    base, patched = forwards
+    base, patched = forwards  # U installed first
     try:
         from solution.kernels import nf4 as k1
     except Exception:  # noqa: BLE001
@@ -378,16 +508,23 @@ def test_composes_with_k1_k3_k4(forwards, monkeypatch):
             while getattr(fn, unpad._K3_MARK, False):
                 fn = fn.__wrapped__
             cls.forward = fn
+        if order == "k3_then_u":
+            mq.Qwen2Model.forward = base  # take U out, install K3, then U again
         k3.patch_qwen2_rmsnorm()
         k3.patch_qwen2_decoder_layer()
+        if order == "k3_then_u":
+            assert unpad.patch_qwen2_model_unpad()
+            patched = mq.Qwen2Model.forward
+            assert getattr(patched, unpad._MARK, False)
 
     pm = build(hidden=1536, heads=12, kv_heads=2, inter=8960, layers=2, vocab=1024,
                four_bit_mlp=True)
     batch = make_batch(pm.config.vocab_size)
-    base_run = run(pm, batch, base)
+    extra = {"num_items_in_batch": num_items(batch)}
+    base_run = run(pm, batch, base, **extra)
     n_base = len(fused_calls)
     before = counts()
-    new_run = run(pm, batch, patched)
+    new_run = run(pm, batch, patched, **extra)
     assert counts()["packed"] == before["packed"] + 1
     if k3 is not None:
         assert n_base == len(fused_calls) - n_base == pm.config.num_hidden_layers
@@ -406,9 +543,13 @@ def test_composes_with_k2_head(forwards, monkeypatch):
 
     pm = build()
     batch = make_batch(pm.config.vocab_size)
+    extra = {"num_items_in_batch": num_items(batch)}  # as Trainer passes it
     results = []
     for forward in (base, patched):
+        before = counts()
         with head_loss.fast_path_scope(step_cls=dict) as holder:
-            results.append(run(pm, batch, forward))
+            results.append(run(pm, batch, forward, **extra))
         assert holder.step is not None  # K2's logits-free path ran on top of both
+        if forward is patched:
+            assert counts()["packed"] == before["packed"] + 1
     check_against_base(pm, batch, *results)

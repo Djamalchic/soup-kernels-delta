@@ -170,6 +170,49 @@ def test_add_rmsnorm_partial_grads(mode):
         torch.testing.assert_close(d1.grad, d0.grad, rtol=2e-3, atol=1e-3)
 
 
+FP16_ULP = 2.0 ** -10  # fp16 has 10 mantissa bits: ulp(v) <= 2**-10 * |v| for normal v
+FLIP_FRAC = 0.02  # share of output elements a few forward rounding flips may move past TOL
+
+
+def _assert_close_up_to_fp16_flips(actual, expected, rtol, atol, max_frac=None):
+    """fp32 agreement except where an fp16 rounding flipped, with those bounded by fp16 resolution.
+
+    With an fp16 attention output, the layer rounds one tensor to fp16 in each direction: the
+    stand-in's `.to(float16)` of its output in the forward, and the fp32 gradient reaching that fp16
+    output in the backward (autograd casts it back to the input dtype, in base's AddBackward and in
+    our delta.to(float32) alike). The fused path computes the values fed into those roundings to a
+    few fp32 ulps of base (input_layernorm is our kernel in the patched run; the gradient comes from
+    soup_addnorm_bwd_kernel instead of autograd's op chain). A difference of k fp32 ulps lands on
+    the other side of an fp16 rounding boundary with probability about k * 2**-13 per element, and
+    such a flip moves that fp16 value by one fp16 ulp, about 1e3 times an fp32 ulp. Downstream
+    (residual, post-norm, MLP, the GEMM gradients) this is an fp16-sized error in a few elements,
+    so no fp32 tolerance can hold for every element. The fp32 delta variant runs the same two
+    kernels (add_rmsnorm casts the delta to fp32 before the launch) and holds them to TOL.
+
+    Checked here:
+    - every element within atol + rtol*|expected| + one fp16 ulp of the tensor's largest magnitude
+      (a flip moves a rounded value v by ulp(v) <= 2**-10 * |v|; the residual, the norm and the
+      GEMMs pass it on with gain about 1 or less, and on this data each compared tensor's largest
+      magnitude is above that of the rounded values feeding it: y = x + delta + mlp(...), and dx
+      and the weight gradients are sums over several rows or elements of the same size);
+    - with max_frac (used for the layer output): at most that share of the elements outside the
+      plain fp32 tolerance. A forward flip moves its own element by one fp16 ulp and the rest of
+      its row through the MLP by ~|W_fc| * ulp ~ 1e-5, so well under 1% of the output leaves TOL;
+      a systematic fp16-level error in the forward (an add or a norm done in fp16) moves about half
+      of it. Not applied to gradients: one backward flip moves a whole row of dx (and of the proj
+      gradient) by ~1e-5, so the share near zero that leaves TOL depends on how many rows flip.
+    """
+    scale = FP16_ULP * expected.abs().max().item()
+    torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol + scale)
+    if max_frac is None:
+        return
+    off = (actual.double() - expected.double()).abs() > atol + rtol * expected.double().abs()
+    frac = off.double().mean().item()
+    assert frac <= max_frac, (
+        f"{int(off.sum())} of {off.numel()} elements ({frac:.3%}) are outside rtol={rtol}, "
+        f"atol={atol}: more than fp16 rounding flips explain")
+
+
 @pytest.mark.parametrize("delta_dtype", [torch.float32, torch.float16])
 @pytest.mark.parametrize("shape", [(1, 5, H), (2, 64, H)])
 def test_stand_in_decoder_layer_matches_base(install, delta_dtype, shape):
@@ -179,11 +222,18 @@ def test_stand_in_decoder_layer_matches_base(install, delta_dtype, shape):
     install()
     y1, dx1, g1 = _run(layer, x)
     assert y1.dtype == y0.dtype == torch.float32
-    torch.testing.assert_close(y1, y0, **TOL)
-    torch.testing.assert_close(dx1, dx0, **TOL)
+
+    def check(a, b, rtol, atol, max_frac=None):
+        if delta_dtype == torch.float32:  # nothing rounded to fp16: fp32 agreement everywhere
+            torch.testing.assert_close(a, b, rtol=rtol, atol=atol)
+        else:
+            _assert_close_up_to_fp16_flips(a, b, rtol, atol, max_frac)
+
+    check(y1, y0, **TOL, max_frac=FLIP_FRAC)
+    check(dx1, dx0, **TOL)
     assert len(g0) == len(g1) == 2  # attn proj + mlp fc; norm weights frozen
     for a, b in zip(g1, g0):
-        torch.testing.assert_close(a, b, rtol=1e-3, atol=1e-4)
+        check(a, b, rtol=1e-3, atol=1e-4)
 
 
 def _real_layer():
