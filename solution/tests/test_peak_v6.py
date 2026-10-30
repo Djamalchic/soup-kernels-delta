@@ -460,8 +460,13 @@ def _compare_runs(ref_a, ref_b, new):
         assert torch.equal(s0, s1)
     _assert_matches(reca["hidden"], recb["hidden"], recn["hidden"], "hidden")
     _assert_matches(la, lb, ln, "loss")
+    # LoRA grads: with A1 (SDPA recompute) the attention backward runs in a different reduction
+    # order, so grads are not bit-exact with v5 (Kaggle T4 30.10: lora_B of layer 1 differed in the
+    # last bits). Same derived bound as test_v6_merged / test_unpad (loss scaled by 2**16).
     for name in ga:
-        _assert_matches(ga[name], gb[name], gn[name], name)
+        if _same(ga[name], gb[name]) and _same(gn[name], ga[name]):
+            continue
+        assert tu.rel(gn[name], ga[name]) <= 2e-2, name
 
 
 def test_small_model_a_and_d_match_v5(forwards, sdpa_patch, monkeypatch):
