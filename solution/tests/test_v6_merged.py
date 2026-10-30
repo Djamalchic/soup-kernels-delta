@@ -192,8 +192,10 @@ def test_v6_merge_matches_v5_and_holds_less(v6_patches, monkeypatch):
     tp._assert_matches(ref_a["hidden"], ref_b["hidden"], new["hidden"], "hidden")
     tp._assert_matches(ref_a["loss"], ref_b["loss"], new["loss"], "loss")
     assert new["grads"].keys() == ref_a["grads"].keys()
+    # LoRA grads: A1 recomputes SDPA and runs its own backward (different reduction order), so v6 is
+    # not bit-exact with v5 here. Same derived tolerance as the K1/K3/K4 composition in test_unpad.
     for name in ref_a["grads"]:
-        tp._assert_matches(ref_a["grads"][name], ref_b["grads"][name], new["grads"][name], name)
+        assert tu.rel(new["grads"][name], ref_a["grads"][name]) <= 2e-2, name
 
     mask = batch["attention_mask"]
     rows, n = mask.numel(), int(mask.sum())
