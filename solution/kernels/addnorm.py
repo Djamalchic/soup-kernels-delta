@@ -63,6 +63,9 @@ import torch
 import triton
 import triton.language as tl
 
+# v10d: precompile.wait() joins a pending background compile (a module-global None check after it)
+from .. import precompile as _precompile
+
 HIDDEN_SIZE = 1536  # Qwen2.5-1.5B hidden size; the only width this file accepts
 BLOCK = 2048  # next power of two >= HIDDEN_SIZE
 NUM_WARPS = 4  # 128 threads x 16 elements per row; 8 is the alternative to time on T4
@@ -249,6 +252,7 @@ def _launch_fwd(x, delta, weight, eps, store_r=True):
     """(r or None, y, rstd). r is returned only when delta is given and store_r is True."""
     if USE_EW_K3:  # v10 P2: the v10 entry, mode 0 (same outputs)
         return _launch_fwd_v10(x, delta, weight, eps, store_r, False)
+    _precompile.wait()  # v10d
     rows = x.shape[0]
     y = torch.empty_like(x)
     keep_r = delta is not None and store_r
@@ -276,6 +280,7 @@ def _launch_bwd(dy, dr, x, weight, rstd, delta=None):
     """dx (+ dr). With delta, x is the residual before the add and the kernel rebuilds x + delta."""
     if USE_EW_K3:  # v10 P2: the v10 entry with fp32 dy (dy_mode 1); same outputs
         return _launch_bwd_v10(None, dy, dr, x, weight, rstd, delta, False)
+    _precompile.wait()  # v10d
     rows = x.shape[0]
     dx = torch.empty_like(x)
     if rows:
@@ -305,6 +310,7 @@ def _launch_bwd(dy, dr, x, weight, rstd, delta=None):
 def _launch_fwd_v10(x, delta, weight, eps, store_r, fp16_out):
     """(r or None, y, rstd) as _launch_fwd; with fp16_out, y is fp16 (mode 1) and no fp32 y is
     allocated. Unused pointer slots get fresh tensors of the slot's dtype (masked off)."""
+    _precompile.wait()  # v10d
     rows = x.shape[0]
     keep_r = delta is not None and store_r
     rstd = torch.empty((rows,), device=x.device, dtype=torch.float32)
@@ -330,6 +336,7 @@ def _launch_fwd_v10(x, delta, weight, eps, store_r, fp16_out):
 def _launch_bwd_v10(dy16, dy, dr, x, weight, rstd, delta, store_da):
     """dx (+ dr) as _launch_bwd. dy16 (fp16, dy_mode 0; with store_da, fp16(dx + dr) is written
     over it) or dy (fp32, dy_mode 1; a residual gradient then rides in DX, has_dr 2)."""
+    _precompile.wait()  # v10d
     rows = x.shape[0]
     dummy = _dummy16(x)
     if dy16 is not None:
@@ -389,6 +396,7 @@ def lora_epilogue_ok(base16, lora16):
 def lora_epilogue_fwd(base16, lora16, scale):
     """f32(base16) + f32(fp16(f32(lora16) * scale)) as a new fp32 tensor (mode 2). The caller
     checked lora_epilogue_ok and that scale is a float."""
+    _precompile.wait()  # v10d
     out = torch.empty(base16.shape, device=base16.device, dtype=torch.float32)
     n = base16.numel()
     with torch.cuda.device(base16.device):
@@ -404,6 +412,7 @@ def lora_epilogue_fwd(base16, lora16, scale):
 def lora_epilogue_bwd(g, scale):
     """(fp16(g), fp16(f32(fp16(g)) * scale)) for an fp32 g (mode 3). g is made contiguous and
     16-byte aligned here if it is not."""
+    _precompile.wait()  # v10d
     n = g.numel()
     if n % 16 or n >= _INT32_END:  # never for an output lora_epilogue_fwd made; torch's two ops
         g16 = g.to(torch.float16)

@@ -36,6 +36,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+# v10d: precompile.wait() joins a pending background compile (a module-global None check after it)
+from .. import precompile as _precompile
 
 # Fixed launch configuration for sm_75 (T4), the one that was measured.
 # 4 warps = 128 threads; ROWS=256 groups -> 2 groups per thread, 1024 packed
@@ -475,6 +477,7 @@ def _launch(packed, quant_state, count, out):
 
 
 def _launch_here(packed, quant_state, n_groups, out32):
+    _precompile.wait()  # v10d: a pending background compile finishes before our first launch
     if USE_UNIFIED_SIG:  # C1: out32 fills the spare pointer slot (never read)
         soup_nf4_dequant_usig[(triton.cdiv(n_groups, _ROWS),)](
             packed,

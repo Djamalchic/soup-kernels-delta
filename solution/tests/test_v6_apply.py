@@ -17,6 +17,7 @@ from solution import (  # noqa: E402
     lora_recompute,
     lora_replay,
     mlp_recompute,
+    precompile,
     saved_compact,
     sdpa_recompute,
     unpad,
@@ -45,6 +46,11 @@ def recorder(monkeypatch):
     monkeypatch.setattr(lora_replay, "patch_lora_dropout_replay", rec("a2"))
     monkeypatch.setattr(lora_recompute, "patch_lora_input_recompute",  # v9 M2
                         rec("m2", lambda: result["m2"]))
+    # v10d: a wiring test never starts the real background compile (it would compile in this
+    # process once an earlier GPU test has created the CUDA context, and patch Qwen2ForCausalLM
+    # for good); test_precompile.py covers start_overlap() / wait() / patch_forward_join().
+    monkeypatch.setattr(precompile, "start_overlap", rec("precompile", False))
+    monkeypatch.setattr(precompile, "patch_forward_join", rec("forward_join"))
     for mod, flag in ((mlp_recompute, "USE_MLP_RECOMPUTE"), (mlp_recompute, "S4_DEQUANT_REUSE"),
                       (unpad, "USE_UNPAD"), (unpad, "S4_OFF_FRACTION"),
                       (fused_block, "USE_FUSED_BLOCK"), (saved_compact, "USE_LORA_ROW_COMPACT"),

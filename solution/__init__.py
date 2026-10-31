@@ -1,8 +1,10 @@
 """Team Delta's solution for the Soup Kernel Challenge.
 
 The harness imports this package and calls `apply()` once, in the same process as `soup train`,
-before Soup builds the model and the trainer. `apply()` only installs guarded patches: it does not
-touch CUDA, compile kernels or change any setting.
+before Soup builds the model and the trainer. `apply()` installs guarded patches and changes no
+setting. It never creates the CUDA context; with v10d (USE_PRECOMPILE_OVERLAP, below) and a context
+the harness already created, its last step starts one background thread that compiles our five
+kernels while Soup loads the model, joined before the first forward (solution/precompile.py).
 
 - K1, `solution/kernels/nf4.py`: our NF4 dequantization kernel replaces bitsandbytes' dequant on
   its dequant+linear path, in the forward pass and in the backward re-dequant (bit-exact).
@@ -81,10 +83,15 @@ run inside launches we already make: B's four fp32 <-> fp16 casts inside K3 (`so
 addnorm.py` *_v10 entries, `solution/fused_block.py`), and M2's q/v LoRA output (bnb's `.to(fp32)`,
 peft's clone, `* scaling`, the add, and their backward) as one K3-v10 launch each way
 (`solution/lora_recompute.py`). Same IEEE operations on the same values; still five cubins.
+v10d (USE_PRECOMPILE_OVERLAP, flag below; organisers' answer of 31.10: allowed), `solution/
+precompile.py`: at the end of apply() one thread compiles the five kernels the run launches
+(JITFunction.warmup with their production argument kinds: same cache keys, same binaries, same
+values) while Soup builds the model; the first Qwen2ForCausalLM.forward, and every launch helper of
+ours, joins it first. The compile time stays inside the measured run, with the same empty cache.
 """
 
-from . import fused_block, head_loss, lora_recompute, lora_replay, mlp, mlp_recompute, saved_compact
-from . import sdpa_recompute, unpad
+from . import fused_block, head_loss, lora_recompute, lora_replay, mlp, mlp_recompute, precompile
+from . import saved_compact, sdpa_recompute, unpad
 from .head_loss import patch_head_loss
 from .kernels.nf4 import patch_bnb_matmul_4bit
 from .layers import patch_qwen2_decoder_layer, patch_qwen2_rmsnorm
@@ -176,8 +183,46 @@ EW_K3_FP16 = True
 EW_LORA_EPILOGUE = True
 EW_LORA_NO_CLONE = True
 
+# v10d (solution/precompile.py): the last step of apply() starts ONE background thread that runs
+# JITFunction.warmup for the five kernels the run launches (K1, the K3 pair that _ew_k3() selects,
+# K2, K4; C1 signatures) and prebuilds their shared gcc launcher, while Soup goes on to load and
+# quantize the model. Joined by the first Qwen2ForCausalLM.forward (and, as a safety net, by every
+# launch helper of ours) before any of our kernels launches; JOIN_TIMEOUT_S guards a hang. Same
+# cache keys -> same binaries -> same values; nothing launched or allocated on the GPU; only when
+# the CUDA context already exists (harness/_train.py:120) and Triton is real. Each warmup adds 1 to
+# the harness's triton_launches (never timed). v10 P1 did the same compiles inside apply() (Kaggle
+# T4: step_s[0] -2.68 s, apply_s +2.74 s, wall +-0); the gain here is only the part that overlaps
+# Soup's model loading [estimate -1...-2.5 s of wall]. False = v10c.
+USE_PRECOMPILE_OVERLAP = True
+
 
 def apply():
+    """Install the patches; with USE_PRECOMPILE_OVERLAP, then start the background compile."""
+    _apply_patches()
+    if USE_PRECOMPILE_OVERLAP:
+        _start_precompile()
+
+
+def _ew_k3():
+    """v10 P2's K3 switch, as _apply_patches() writes it into kernels/addnorm.py USE_EW_K3; the K3
+    pair the background compile warms comes from here too."""
+    return bool(USE_ELEMENTWISE_FUSION) and bool(EW_K3_FP16)
+
+
+def _start_precompile():
+    """Start the background compile and, when it runs, the forward-side join. Never raises."""
+    try:
+        started = precompile.start_overlap(addnorm=bool(USE_ADDNORM), head_ce=bool(USE_HEAD_CE),
+                                           swiglu=bool(USE_SOUP_SWIGLU),
+                                           unified=bool(USE_UNIFIED_SIG), ew_k3=_ew_k3())
+        if started:
+            precompile.patch_forward_join()
+        return started
+    except Exception:  # noqa: BLE001 - every kernel then compiles at its first launch, as in v10c
+        return False
+
+
+def _apply_patches():
     # nf4 and head_ce are imported above (K1 patch, head_loss); addnorm loads here. Importing a
     # kernel module only defines Triton functions: no CUDA work, no compile.
     from .kernels import addnorm as _k3, head_ce as _k2, nf4 as _nf4
@@ -191,7 +236,7 @@ def apply():
     # v10 P2, read at every call. The epilogue launches the K3-v10 forward entry, so it is only on
     # together with EW_K3_FP16 (otherwise a run would compile both K3 forward entries).
     _ew = bool(USE_ELEMENTWISE_FUSION)
-    _k3.USE_EW_K3 = _ew and bool(EW_K3_FP16)
+    _k3.USE_EW_K3 = _ew_k3()  # = _ew and EW_K3_FP16; the K3 pair precompile warms follows it
     lora_recompute.USE_LORA_EPILOGUE = _k3.USE_EW_K3 and bool(EW_LORA_EPILOGUE)
     lora_recompute.USE_LORA_NO_CLONE = _ew and bool(EW_LORA_NO_CLONE)
     mlp.USE_SOUP_SWIGLU = bool(USE_SOUP_SWIGLU)  # C2, read by K4 and S4 at every call

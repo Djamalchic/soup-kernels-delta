@@ -40,6 +40,9 @@ import torch
 import triton
 import triton.language as tl
 
+# v10d: precompile.wait() joins a pending background compile (a module-global None check after it)
+from .. import precompile as _precompile
+
 _TILE = 1024  # elements per program, as the example's BLOCK
 _NUM_WARPS = 4  # Triton's default, as the example's launch
 _FORWARD, _BACKWARD = 0, 1
@@ -84,6 +87,7 @@ def soup_swiglu_kernel(
 def _launch(mode, gate, up, hid, dgate, dup):
     """One launch over gate.numel() elements. Every tensor is contiguous with gate's numel; the
     spare pointer slots get gate (never read, not specialised)."""
+    _precompile.wait()  # v10d: a pending background compile finishes before our first launch
     n = gate.numel()
     if n == 0:
         return

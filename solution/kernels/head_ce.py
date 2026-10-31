@@ -56,6 +56,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+# v10d: precompile.wait() joins a pending background compile (a module-global None check after it)
+from .. import precompile as _precompile
+
 IGNORE_INDEX = -100
 
 # Head rows per tile. 151936 = 9 * 16384 + 4480: 10 tiles per pass. Peak extra memory at T = 512:
@@ -188,6 +191,7 @@ def soup_head_ce_usig(
 
 
 def _launch(grid, out16, target, state, scale, w32, row0, n_cols, col0, mode):
+    _precompile.wait()  # v10d: a pending background compile finishes before our first launch
     if USE_UNIFIED_SIG:  # C1: `state` (fp32, always passed) fills the two spare pointer slots
         soup_head_ce_usig[grid](
             out16, target, state, scale, w32, state, state,
