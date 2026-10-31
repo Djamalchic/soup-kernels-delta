@@ -570,6 +570,7 @@ def _reject_reason(module, x):
         from bitsandbytes.nn import Params4bit
     except Exception:  # noqa: BLE001
         return "bitsandbytes.nn.Params4bit unavailable"
+    nf4 = _active_nf4()
     for name in _PROJ_NAMES:
         layer = getattr(module, name)
         if getattr(layer, "bias", None) is not None:
@@ -577,11 +578,13 @@ def _reject_reason(module, x):
         weight = getattr(layer, "weight", None)
         if not isinstance(weight, Params4bit) or weight.requires_grad:
             return f"{name}.weight is not a frozen Params4bit"
-        if weight.device != x.device:
-            return f"{name}.weight is on another device"
         state = getattr(weight, "quant_state", None)
         if state is None or getattr(state, "quant_type", None) != "nf4":
             return f"{name} is not nf4-quantized"
+        # v12 W: a streamed weight's own tensors sit on the host; K1 reads it from its GPU slot.
+        device = nf4.weight_device(weight, state) if nf4 is not None else weight.device
+        if device != x.device:
+            return f"{name}.weight is on another device"
         # Forward hooks would fire twice; backward hooks would never fire for the recomputed calls.
         if any(getattr(layer, hooks, None) for hooks in _LAYER_HOOKS):
             return f"{name} has module hooks"

@@ -221,16 +221,95 @@ def _cast_tile(w32, v0, nv, wbuf, target, state):
 
 
 def _weight_tiles(weight, H, device):
-    """(fp16 tile getter, weight buffer or None). An fp16 head is sliced, an fp32 one is cast by
-    mode 2 into one reused buffer. Any other dtype is refused (head_loss guards allow these two)."""
+    """(fp16 tile getter, weight buffer or None). An fp16 head on the device is sliced, an fp16
+    head on the host (v12 W, pinned) is copied tile by tile through a double buffer, an fp32 one
+    is cast by mode 2 into one reused buffer. Any other dtype is refused (head_loss guards allow
+    these)."""
     w = weight.detach()
     if w.dtype == torch.float16:
+        if not w.is_cuda:
+            return _host_tiles(w, H, device)
         return (lambda v0, nv, target, state: w[v0:v0 + nv]), None
     if w.dtype != torch.float32:
         raise TypeError(f"SoupHeadCE: head weight must be fp32 or fp16, got {w.dtype}")
     tile = min(VOCAB_TILE, w.shape[0])
     wbuf = torch.empty((tile, H), dtype=torch.float16, device=device)
     return (lambda v0, nv, target, state: _cast_tile(w, v0, nv, wbuf, target, state)), wbuf
+
+
+# v12 W: one side stream per device for the host -> device tile copies, created on first use.
+_SIDE_STREAMS = {}
+# Host tiles copied (double-buffered) and fetched out of the expected order (synchronous copy).
+HOST_TILE_COUNTS = {"copies": 0, "sync": 0}
+
+
+def _side_stream(device):
+    index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    stream = _SIDE_STREAMS.get(index)
+    if stream is None:
+        stream = _SIDE_STREAMS[index] = torch.cuda.Stream(device=index)
+    return stream
+
+
+def _host_tiles(w, H, device):
+    """Tile getter for an fp16 head in host memory (v12 W: head_loss put the verified fp16 copy
+    in pinned memory). The tiles are the same rows _tiles() walks; each is copied into one half
+    of a [2, tile, H] device buffer on a side stream, one tile ahead of the GEMMs.
+
+    Synchronisation (compute = the caller's current stream, side = this device's side stream):
+    - the copy of tile t into half t % 2 is issued after the side stream waited on an event
+      recorded on the compute stream at that moment; it is issued from the getter of tile t - 1,
+      i.e. after the GEMMs of tile t - 2 (the half's previous reader) were issued, so they
+      complete before the copy starts;
+    - the getter of tile t makes the compute stream wait on the half's `ready` event, recorded on
+      the side stream behind its copy, before returning the view the GEMMs read;
+    - every issued copy is consumed by the loop in order, so when the buffer dies at the end of
+      _forward / _backward the compute stream has waited on every write into it; the caching
+      allocator hands it on to later compute-stream allocations only (no record_stream needed).
+    A pageable host weight, or a tile asked out of order, is copied synchronously: correct, slow.
+    Same fp16 rows as the sliced device head: identical GEMM operands, identical results."""
+    tile, tiles = _tiles(w.shape[0])
+    if not tiles or not w.is_pinned():
+        HOST_TILE_COUNTS["sync"] += 1
+        return (lambda v0, nv, target, state: w[v0:v0 + nv].to(device)), None
+    wbuf = torch.empty((2, tile, H), dtype=torch.float16, device=device)
+    side = _side_stream(device)
+    compute = torch.cuda.current_stream(device)
+    ready = (torch.cuda.Event(), torch.cuda.Event())
+    position = [0]
+
+    def issue(t):
+        v0, nv = tiles[t]
+        half = t & 1
+        fence = torch.cuda.Event()
+        fence.record(compute)
+        side.wait_event(fence)
+        with torch.cuda.stream(side):
+            wbuf[half, :nv].copy_(w[v0:v0 + nv], non_blocking=True)
+        ready[half].record(side)
+        HOST_TILE_COUNTS["copies"] += 1
+
+    issue(0)
+
+    def getter(v0, nv, target, state):
+        t = position[0]
+        if t >= len(tiles) or tiles[t] != (v0, nv):
+            # Not the order _tiles() gives (no caller of ours does this): let every issued copy
+            # land before anything else touches the buffer, then copy this tile synchronously.
+            compute.wait_event(ready[0])
+            compute.wait_event(ready[1])
+            HOST_TILE_COUNTS["sync"] += 1
+            return w[v0:v0 + nv].to(device)
+        position[0] = t + 1
+        half = t & 1
+        compute.wait_event(ready[half])
+        if t + 1 < len(tiles):
+            issue(t + 1)
+        return wbuf[half, :nv]
+
+    return getter, wbuf
 
 
 class SoupHeadCE(torch.autograd.Function):

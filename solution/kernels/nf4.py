@@ -90,6 +90,28 @@ DENSE_CACHE_MIB = 64
 # v8 C1 (solution/kernels/__init__.py): launch soup_nf4_dequant_usig, the same kernel inlined behind
 # the launcher signature all our kernels share. solution.apply() sets it; default = v7 launch.
 USE_UNIFIED_SIG = False
+# v12 W (solution/weight_stream.py): the registry that maps a streamed weight's QuantState (the
+# real one on the host or its GPU shadow) to the weight's GPU slot view and shadow state, or None
+# (every weight is where its tensors say). weight_stream.install() sets it. Every entry point
+# below asks it first, so this module, bnb's fallback and every caller see the GPU pair without
+# knowing about the slots; the lookup also tells the streamer which layer is being read.
+STREAMER = None
+
+
+def _streamed(packed, quant_state):
+    """(packed, quant_state) to read: the GPU slot pair of a streamed weight, else unchanged."""
+    streamer = STREAMER
+    if streamer is None:
+        return packed, quant_state
+    return streamer.resolve(packed, quant_state)
+
+
+def weight_device(packed, quant_state):
+    """The device K1 reads this weight from: the GPU slot of a streamed weight (v12; its own
+    tensors are on the host), else packed's. Guards that compare a Params4bit's device with an
+    activation's ask this (mlp_recompute._reject_reason, merged_qkv._k1_dense / _build_weight)."""
+    packed, _ = _streamed(packed, quant_state)
+    return packed.device
 
 
 @triton.jit(do_not_specialize=["n_groups"])
@@ -333,6 +355,7 @@ def _checked_entry(packed, quant_state):
     """((n, k), entry). `entry` is the _VALID record this (packed, quant_state) pair matched or
     was just stored under; None when nothing describes this exact pair (then no cache keyed on
     the record may be trusted, see nf4_dequantize)."""
+    packed, quant_state = _streamed(packed, quant_state)  # v12: the GPU pair is what is validated
     key = id(quant_state)
     entry = _VALID.get(key)
     if entry is not None:
@@ -522,6 +545,10 @@ def nf4_dequantize(packed, quant_state, out=None):
     works, but Triton compiles a second specialization for it; an odd element
     offset goes through a temporary.
     """
+    # v12: a streamed weight is read from its GPU slot (the view and the shadow state), so every
+    # device below (out's check, the launch, the result) is the slot's. _checked_entry resolves
+    # again: a no-op on an already resolved pair.
+    packed, quant_state = _streamed(packed, quant_state)
     (n, k), entry = _checked_entry(packed, quant_state)
     count = n * k
 
@@ -649,6 +676,7 @@ def k1_dense_path(A, B, quant_state):
     private heuristic picks its custom 4-bit GEMM (ops.py:921-926, 954-964).
     A failing or missing heuristic returns False (bnb's path), as before.
     """
+    B, quant_state = _streamed(B, quant_state)  # v12: the device compared below is the slot's
     if (
         not isinstance(A, torch.Tensor)
         or not A.is_cuda
@@ -690,6 +718,9 @@ def soup_matmul_4bit(A, B, quant_state, out=None, bias=None):
     # which Linear4bit.forward reaches as `bnb.matmul_4bit`
     # (bitsandbytes/nn/modules.py:637). We only replace bnb's
     # dequant + F.linear path; k1_dense_path decides when that is.
+    # v12: a streamed weight is read from its GPU slot on both paths (bnb's fallback included);
+    # the Function then saves the run-long slot view and the shadow state for its backward.
+    B, quant_state = _streamed(B, quant_state)
     if out is not None or not k1_dense_path(A, B, quant_state):
         return _get_original_matmul_4bit()(
             A, B, quant_state=quant_state, out=out, bias=bias

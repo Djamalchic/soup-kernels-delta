@@ -171,9 +171,9 @@ def _k1_dense(x, weight, state, nf4):
         (n, k), entry = nf4._checked_entry(weight, state)
     except (TypeError, ValueError):
         return None
-    # absmax sits on the packed weight's device (nf4._validate_inputs); a plain tensor, so no
-    # trip through Params4bit's __torch_function__ (as nf4._launch, nf4.py:466-472).
-    if state.absmax.device != x.device or x.shape[-1] != k:
+    # The device K1 reads the weight from: its GPU slot when v12 W streams it (its own tensors
+    # are then on the host), else the packed weight's (= absmax's, nf4._validate_inputs).
+    if nf4.weight_device(weight, state) != x.device or x.shape[-1] != k:
         return None
     m = x.numel() // k
     if m <= 4:
@@ -271,7 +271,9 @@ def _build_weight(plan, use_i3=True):
     nf4 = _REFS["nf4"]
     nq, nk, nv = plan.rows
     k = plan.hidden
-    w = torch.empty((nq + nk + nv, k), device=plan.states[0].absmax.device, dtype=torch.float16)
+    # v12 W: the slot's device for a streamed weight (nf4.weight_device), else the weight's own.
+    w = torch.empty((nq + nk + nv, k), device=nf4.weight_device(plan.weights[0], plan.states[0]),
+                    dtype=torch.float16)
     bounds = ((0, nq), (nq, nq + nk), (nq + nk, nq + nk + nv))
     for (lo, hi), weight, state in zip(bounds, plan.weights, plan.states):
         if use_i3 and _i3_holds(nf4, (hi - lo, k)):

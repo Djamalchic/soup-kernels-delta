@@ -20,6 +20,7 @@ Only `main` is the submission: the v11 code (`f218f86`, branch `v11-candidate`) 
 | v10c | `v10c-candidate`, code `0b9e562` | fp16 head |
 | v10d | `v10d-candidate`, code `6b56d31` | compile overlap |
 | v11 | `v11-candidate`, code `f218f86` | Q, merged q/k/v GEMM (submitted) |
+| v12 | `v12-candidate` | W, weight streaming: decoder NF4 weights and the fp16 tied head in pinned host memory, two GPU layer slots, side-stream prefetch (`USE_WEIGHT_STREAMING`, `STREAM_HEAD`; not yet run on Kaggle) |
 
 Other branches:
 
@@ -86,3 +87,4 @@ The names used in the README, `SUBMISSION.md` and the code. Code comments tag a 
 | fp16 head (v10c) | K2 part 3: the tied embedding and LM head stored in fp16 after a lossless check | `head_loss.py` | on |
 | compile overlap (v10d) | background compile while Soup loads the model | `precompile.py` | on |
 | Q (v11) | q, k, v base projections as one fp16 GEMM, one dX GEMM in backward | `merged_qkv.py`, `unpad.py`, `lora_recompute.py` | on (weight built per call; `MERGED_QKV_CACHE` off) |
+| W (v12) | decoder NF4 weights + fp16 tied head on pinned host memory, two GPU layer slots, side-stream prefetch one layer ahead in forward and backward; K2 tiles double-buffered from the host | `weight_stream.py`, `kernels/nf4.py` (resolve hooks), `head_loss.py`, `kernels/head_ce.py`, `precompile.py` (install hook) | `v12-candidate` only (`USE_WEIGHT_STREAMING`, `STREAM_HEAD`) |

@@ -77,6 +77,14 @@ S4_OFF_FRACTION = 0.0
 _MARK = "_soup_delta_unpad"
 _K3_MARK = "_soup_delta_addnorm"  # = solution/layers.py _MARK (K3)
 _S4_MARK = "_soup_delta_mlp_recompute"  # = solution/mlp_recompute.py _PATCH_MARK
+_PINNED_MARK = "_soup_delta_pinned_head"  # = solution/head_loss.py _PINNED_MARK (v12 W)
+
+
+def _pinned_head(weight):
+    """v12 W: head_loss moved this fp16 embedding / head weight to pinned host memory and patched
+    nn.Embedding.forward to look it up there (the lookup lands on the ids' device)."""
+    return getattr(weight, _PINNED_MARK, False) is True and not weight.is_cuda
+
 
 # At M <= 128 bitsandbytes on a T4 (sm75) runs gate/up through its own small-M GEMM, and down at
 # M <= 64 (bitsandbytes/backends/cuda/ops.py:703-709; M = A.numel() // K at :947-948), i.e. not
@@ -268,8 +276,9 @@ def _fast_path_ok(model, input_ids, attention_mask, position_ids, past_key_value
         return None
     if use_cache:
         return None  # base would build a DynamicCache (lines 358-359) and return it
-    if model.embed_tokens.weight.device != input_ids.device:
-        return None
+    emb_weight = model.embed_tokens.weight
+    if emb_weight.device != input_ids.device and not _pinned_head(emb_weight):
+        return None  # v12 W: the pinned fp16 embedding is looked up on the host (head_loss)
 
     config = model.config
     if "is_causal" in kwargs or hasattr(config, "is_causal"):

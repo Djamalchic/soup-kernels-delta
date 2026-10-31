@@ -81,6 +81,11 @@ _CANCEL = threading.Event()  # set by a timed-out join: the worker stops after i
 _WORKER = None  # the worker thread until someone joined it; None otherwise (also: never started)
 _STARTED = False  # one attempt per process: apply() runs once in training, many times in tests
 _FORWARD_MARK = "_soup_delta_precompile_join"
+# v12 W: solution.apply() sets it to weight_stream.maybe_install (never raises, once per model);
+# the patched Qwen2ForCausalLM.forward calls it after the join and before the original forward, i.e.
+# after Soup has loaded and quantized the model and before any decoder weight is read. Read at
+# every forward call, so it works whether or not the background compile ran.
+_STREAM_INSTALL = None
 
 
 def kernel_specs(addnorm=True, head_ce=True, swiglu=True, ew_k3=False):
@@ -297,6 +302,9 @@ def patch_forward_join():
         def forward(self, *args, **kwargs):
             if _WORKER is not None:
                 wait(by="forward")
+            install = _STREAM_INSTALL  # v12 W: once per model, before its first decoder forward
+            if install is not None:
+                install(self)
             return current(self, *args, **kwargs)
 
         setattr(forward, _FORWARD_MARK, True)

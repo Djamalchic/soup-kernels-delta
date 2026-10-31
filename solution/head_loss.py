@@ -46,6 +46,24 @@ modules) sends the call to the original.
    embeddings only when targeted or resized, peft/utils/save_and_load.py:421-457). Saves 445 MiB of
    static memory (151936 x 1536 x 2 bytes) and K2's per-step cast of the head (2 passes x ~1.3 GB
    of traffic). Any failed condition leaves the model untouched.
+
+4. v12 W, STREAM_HEAD (needs part 3, K2 and solution/weight_stream.py's flag): the verified fp16
+   copy goes to pinned host memory instead of the GPU (`p.data = host`, the same swap), so the
+   445 MiB leave the GPU too. Its two readers:
+   - the embedding lookup: a guarded class patch of torch.nn.Embedding.forward
+     (patch_pinned_embedding) takes a weight marked _PINNED_MARK with CUDA int ids, gathers the
+     needed rows on the host (ids to the CPU: one D2H sync of a few KiB; index_select into a
+     run-long pinned fp16 buffer) and copies them to the ids' device in one non_blocking H2D on
+     the current stream (~4 MiB at 2048 tokens), then the hook of part 3 widens them to fp32: the
+     same rows base's F.embedding returns. The pinned row buffer is reused only after the event
+     recorded behind the previous copy has completed (one event.synchronize per step, normally
+     already done). Any other call runs the original forward.
+   - K2's tiles: kernels/head_ce.py _weight_tiles feeds each vocabulary tile from the pinned weight
+     through a double-buffered side-stream copy (its own stream / event synchronisation).
+   Numerics: the same fp16 rows and the same tiles; nothing changes. Guards: the K2 fast path
+   accepts a pinned head weight (it is what K2 reads); if the model ever declines the fast path,
+   forward_impl runs the original forward with the head temporarily copied back to the GPU
+   (_original_with_gpu_head: correct, slow, never in the measured run).
 """
 
 import collections.abc
@@ -66,6 +84,16 @@ STEP_ATTR = "_soup_chunked_step"  # = soup_cli.utils.stream_loss_chunk.STEP_ATTR
 STORE_HEAD_FP16 = False
 # Set on a Parameter whose fp32 values we moved, verified, into fp16 storage.
 _FP16_MARK = "_soup_delta_fp16_head"
+# v12 W (part 4). solution.apply() sets it (only with STORE_HEAD_FP16, K2 and weight streaming).
+STREAM_HEAD = False
+# Set on a Parameter whose fp16 copy lives in pinned host memory (= solution/unpad.py _PINNED_MARK).
+_PINNED_MARK = "_soup_delta_pinned_head"
+_EMB_PATCH_MARK = "_soup_delta_pinned_embedding"
+# The pinned fp16 row buffer of the embedding lookup and the event behind its last H2D copy.
+_EMB_ROWS = {"buf": None, "event": None}
+# "pinned": heads moved to the host; "lookups": pinned embedding lookups; "gpu_fallback": original
+# forwards run with the head copied back (never expected in a run). Tests read them.
+STREAM_HEAD_COUNTS = {"pinned": 0, "lookups": 0, "gpu_fallback": 0}
 # Rows per verification chunk: an 8192 x 1536 fp32 temporary (48 MiB) at a time.
 _STORE_CHUNK_ROWS = 8192
 # Models store_head_fp16 already looked at (one attempt each; a refusal costs a sync and a copy).
@@ -230,9 +258,10 @@ def _model_fast_path_ok(model, args, kwargs):
         return False
     if weight.dtype != torch.float32 and not _is_fp16_stored(weight):
         return False
-    if weight.dim() != 2 or not weight.is_cuda:
+    if weight.dim() != 2 or not weight.is_contiguous():
         return False
-    if not weight.is_contiguous() or weight.device != labels.device:
+    # v12 W: a pinned host copy is what K2 streams its tiles from; else the labels' device.
+    if not is_pinned_head(weight) and (not weight.is_cuda or weight.device != labels.device):
         return False
     return weight.shape[0] == getattr(config, "vocab_size", -1)
 
@@ -278,7 +307,7 @@ def _trainer_fast_path_ok(trainer, model, inputs):
     if type(base) is not _REFS["Qwen2ForCausalLM"] or base.training is not True:
         return False
     weight = getattr(getattr(base, "lm_head", None), "weight", None)
-    return isinstance(weight, torch.Tensor) and weight.is_cuda
+    return isinstance(weight, torch.Tensor) and (weight.is_cuda or is_pinned_head(weight))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -353,15 +382,139 @@ def store_head_fp16(model):
             if copy is None:
                 return False
             copies.append(copy)
+    # v12 W (part 4): the fp16 copies go to pinned host memory when every step of that works
+    # (pinned allocation, the embedding patch); otherwise the GPU copies, as in v10c.
+    pinned = _pinned_copies(copies) if STREAM_HEAD else None
+    if pinned is not None and not patch_pinned_embedding():
+        pinned = None
     # Hook first: it passes outputs through until the weight is marked, so no order of failure
     # can leave an fp16 embedding output in the fp32 residual stream.
     emb.register_forward_hook(_embedding_output_to_fp32)
-    for p, copy in zip(params, copies):
+    for p, copy in zip(params, pinned if pinned is not None else copies):
         # The same in-place storage swap peft makes the other way (other.py:202): the Parameter
         # object, its tie and its requires_grad=False are kept; the fp32 storage is freed here.
         p.data = copy
         setattr(p, _FP16_MARK, True)
+        if pinned is not None:
+            setattr(p, _PINNED_MARK, True)
+    if pinned is not None:
+        STREAM_HEAD_COUNTS["pinned"] += 1
     return True
+
+
+# ---------------------------------------------------------------------------------------------
+# Part 4 (v12 W): the fp16 head on pinned host memory, the embedding looked up there
+# ---------------------------------------------------------------------------------------------
+
+def is_pinned_head(weight):
+    """True for the fp16 head / embedding weight store_head_fp16 put in pinned host memory."""
+    return (isinstance(weight, torch.Tensor) and getattr(weight, _PINNED_MARK, False) is True
+            and not weight.is_cuda and weight.dtype == torch.float16)
+
+
+def _pinned_copies(copies):
+    """Pinned host fp16 tensors holding `copies` (GPU fp16), or None when pinning is not
+    available. The D2H copies are complete when this returns (one synchronize)."""
+    hosts = []
+    try:
+        for copy in copies:
+            host = torch.empty(copy.shape, dtype=torch.float16, pin_memory=True)
+            if not host.is_pinned():
+                return None
+            host.copy_(copy)
+            hosts.append(host)
+        torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001 - no pinned memory: keep the GPU copies
+        return None
+    return hosts
+
+
+def _pinned_embedding_ok(module, ids):
+    weight = getattr(module, "weight", None)
+    if not is_pinned_head(weight) or weight.dim() != 2 or not weight.is_contiguous():
+        return False
+    if not isinstance(ids, torch.Tensor) or not ids.is_cuda:
+        return False
+    if ids.dtype not in (torch.int64, torch.int32):
+        return False
+    # max_norm renormalises the weight in place inside F.embedding (refused at store time too).
+    return getattr(module, "max_norm", None) is None
+
+
+def _pinned_rows(n, hidden):
+    """The run-long pinned fp16 [>= n, hidden] row buffer, free for writing: the H2D copy of its
+    previous contents has completed (event.synchronize; normally long done)."""
+    buf, event = _EMB_ROWS["buf"], _EMB_ROWS["event"]
+    if event is not None:
+        event.synchronize()
+    if buf is None or buf.shape[0] < n or buf.shape[1] != hidden:
+        rows = max(n, 2048)  # the task's 2048 tokens per step [B x T] in one allocation
+        buf = torch.empty((rows, hidden), dtype=torch.float16, pin_memory=True)
+        _EMB_ROWS["buf"] = buf
+    return buf
+
+
+def pinned_embedding_lookup(weight, ids):
+    """F.embedding(ids, weight) for a pinned fp16 weight and CUDA ids: the rows gathered on the
+    host and copied to the ids' device in one non_blocking H2D on the current stream."""
+    shape = tuple(ids.shape)
+    hidden = weight.shape[1]
+    flat = ids.reshape(-1)
+    n = flat.numel()
+    if n == 0:
+        return torch.empty((*shape, hidden), dtype=weight.dtype, device=ids.device)
+    host_ids = flat.to("cpu")  # one D2H sync of n x 8 bytes
+    rows = _pinned_rows(n, hidden)[:n]
+    torch.index_select(weight, 0, host_ids, out=rows)
+    out = rows.to(ids.device, non_blocking=True)  # pinned -> device, ordered on the current stream
+    event = _EMB_ROWS["event"]
+    if event is None:
+        event = _EMB_ROWS["event"] = torch.cuda.Event()
+    event.record(torch.cuda.current_stream(ids.device))
+    STREAM_HEAD_COUNTS["lookups"] += 1
+    return out.view(*shape, hidden)
+
+
+def patch_pinned_embedding():
+    """torch.nn.Embedding.forward looks a pinned, marked weight up on the host; every other call
+    is the original. Idempotent, no CUDA work; True when in place."""
+    cls = torch.nn.Embedding
+    current = cls.forward
+    if getattr(current, _EMB_PATCH_MARK, False) is True:
+        return True
+    if not callable(current):
+        return False
+    original = current
+
+    @functools.wraps(original)
+    def forward(self, input):
+        if _pinned_embedding_ok(self, input):
+            try:
+                return pinned_embedding_lookup(self.weight, input)
+            except Exception:  # noqa: BLE001 - a full copy of the weight: correct, 445 MiB, slow
+                return torch.nn.functional.embedding(input, self.weight.to(input.device))
+        return original(self, input)
+
+    setattr(forward, _EMB_PATCH_MARK, True)
+    cls.forward = forward
+    return True
+
+
+def _original_with_gpu_head(original, model, args, kwargs):
+    """The original forward with a pinned head temporarily copied back to the GPU (the lm_head
+    and the embedding share the Parameter): correct and slow; a safety net for a declined fast
+    path, never expected inside the measured run. The temporary GPU copy stays alive as long as
+    autograd's graph of this forward references it."""
+    param = model.lm_head.weight
+    device = next((t.device for t in kwargs.values() if isinstance(t, torch.Tensor)),
+                  torch.device("cuda"))
+    host = param.data
+    STREAM_HEAD_COUNTS["gpu_fallback"] += 1
+    param.data = host.to(device)
+    try:
+        return original(model, *args, **kwargs)
+    finally:
+        param.data = host
 
 
 def _maybe_store_head_fp16(trainer, model):
@@ -388,16 +541,27 @@ def _maybe_store_head_fp16(trainer, model):
 # The two patched functions (module level, so the tests can call them with any `original`)
 # ---------------------------------------------------------------------------------------------
 
+def _original_forward(original, model, args, kwargs):
+    """The untouched forward; with a pinned head (v12 W) the lm_head is copied back first."""
+    try:
+        pinned = is_pinned_head(getattr(getattr(model, "lm_head", None), "weight", None))
+    except Exception:  # noqa: BLE001
+        pinned = False
+    if pinned:
+        return _original_with_gpu_head(original, model, args, kwargs)
+    return original(model, *args, **kwargs)
+
+
 def forward_impl(original, model, args, kwargs):
     holder = _ACTIVE.get()
     if holder is None:
-        return original(model, *args, **kwargs)
+        return _original_forward(original, model, args, kwargs)
     try:
         ok = _model_fast_path_ok(model, args, kwargs)
     except Exception:  # noqa: BLE001 - an unexpected object is never ours to handle
         ok = False
     if not ok:
-        return original(model, *args, **kwargs)
+        return _original_forward(original, model, args, kwargs)
 
     kw = dict(kwargs)
     kw.pop("return_dict", None)  # can_return_tuple pops it before the body runs (generic.py:936)

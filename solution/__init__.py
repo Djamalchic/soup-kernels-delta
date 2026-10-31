@@ -103,10 +103,17 @@ bit-exact dequant), split into q / k / v inside one autograd node whose backward
 the q / v LoRA halves are M2's code unchanged (same dropout draws, same order). Not bit-identical:
 cuBLAS's N = 2048 kernel may round an output element to the neighbouring fp16 value, and dX is
 summed in fp32 inside the GEMM and rounded once (solution/tests/test_merged_qkv.py tolerances).
+v12 W (USE_WEIGHT_STREAMING + STREAM_HEAD, flags below), `solution/weight_stream.py`, hooks in
+`solution/kernels/nf4.py`, `solution/head_loss.py`, `solution/kernels/head_ce.py`: the decoder's
+NF4 weights and the fp16 tied head live in pinned host memory; two GPU slots hold the layer in use
+and the next one in the direction of travel (a side stream copies one layer ahead in forward and
+in backward), and K2's tiles come through a double buffer the same way. Installed on the first
+forward, all or nothing; every weight read still goes through K1, which resolves a streamed weight
+to its GPU slot. Same bytes, same kernels, same GEMMs: same values as v11.
 """
 
 from . import fused_block, head_loss, lora_recompute, lora_replay, merged_qkv, mlp, mlp_recompute
-from . import precompile, saved_compact, sdpa_recompute, unpad
+from . import precompile, saved_compact, sdpa_recompute, unpad, weight_stream
 from .head_loss import patch_head_loss
 from .kernels.nf4 import patch_bnb_matmul_4bit
 from .layers import patch_qwen2_decoder_layer, patch_qwen2_rmsnorm
@@ -228,6 +235,27 @@ USE_MERGED_QKV = True
 MERGED_QKV_CACHE = False
 MERGED_QKV_CACHE_MIB = 192
 
+# v12 W (solution/weight_stream.py; needs K1, which every base-weight read goes through): after
+# Soup has loaded and quantized the model, on the first Qwen2ForCausalLM.forward, every decoder
+# Linear4bit weight (packed nibbles + both absmax levels; code and offset stay on the GPU) moves to
+# ONE pinned host buffer and the GPU keeps two slots of one layer each (~2 x 25 MiB on 1.5B);
+# layer i + 1 is copied on a side stream while layer i's forward runs, layer i - 1 while its
+# backward runs (events both ways; a layer not in its slot is fetched on the spot). K1 resolves a
+# streamed weight to its slot view inside nf4_dequantize / k1_dense_path / soup_matmul_4bit, so
+# the fused block, S4, Q and bnb's fallback need no new path. Same bytes, same kernel, same
+# GEMMs: same values. Install is all or nothing (any projection K1 would refuse: nothing moves).
+# ~-630 MiB of static GPU memory at the step; the measured peak then becomes the load transient
+# (~1.7 GB [estimate]: the fp32 tied embedding and bnb's quantization happen before our install).
+# False = v11 exactly.
+USE_WEIGHT_STREAMING = True
+# v12 W part 4 (solution/head_loss.py, kernels/head_ce.py; needs USE_WEIGHT_STREAMING, K2 and
+# STORE_HEAD_FP16): the verified fp16 copy of the tied embedding / lm_head goes to pinned host
+# memory instead of the GPU (-445 MiB static). The embedding gathers its rows on the host and
+# copies them in one H2D per step (~4 MiB at 2048 tokens); K2 copies its vocabulary tiles through
+# a double buffer on a side stream (2 x 48 MiB per K2 call at VOCAB_TILE 16384, freed after it).
+# Same fp16 rows, same tiles: same values. False with the flag above on = decoder only.
+STREAM_HEAD = True
+
 
 def apply():
     """Install the patches; with USE_PRECOMPILE_OVERLAP, then start the background compile."""
@@ -318,6 +346,19 @@ def _apply_patches():
     merged_qkv.MERGED_CACHE_MIB = int(MERGED_QKV_CACHE_MIB)
     if USE_MERGED_QKV and USE_UNPAD and lora_recompute.USE_LORA_INPUT_RECOMPUTE:
         merged_qkv.USE_MERGED_QKV = bool(merged_qkv.install())
+    # v12 W: nothing moves here (the model does not exist yet); weight_stream.maybe_install runs
+    # from the first Qwen2ForCausalLM.forward through precompile's wrapper, which is installed
+    # here whether or not the background compile starts. A registry an earlier model installed
+    # (tests) is kept: weights resolve by their own QuantState, never by the flag.
+    streaming = bool(USE_WEIGHT_STREAMING)
+    weight_stream.USE_WEIGHT_STREAMING = streaming
+    precompile._STREAM_INSTALL = weight_stream.maybe_install if streaming else None
+    head_loss.STREAM_HEAD = False
     if USE_HEAD_CE:                # K2
         head_loss.STORE_HEAD_FP16 = STORE_HEAD_FP16
+        # part 4: only with the fp16 copy to move and K2 to read it (the original lm_head would
+        # otherwise run on a host weight; forward_impl's copy-back is a safety net, not a path)
+        head_loss.STREAM_HEAD = bool(STREAM_HEAD and streaming and STORE_HEAD_FP16)
         patch_head_loss()
+    if streaming:
+        precompile.patch_forward_join()  # outermost forward wrapper: install before the decoder

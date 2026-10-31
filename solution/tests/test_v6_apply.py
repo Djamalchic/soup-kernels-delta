@@ -23,6 +23,7 @@ from solution import (  # noqa: E402
     saved_compact,
     sdpa_recompute,
     unpad,
+    weight_stream,
 )
 
 
@@ -64,7 +65,9 @@ def recorder(monkeypatch):
                       (lora_recompute, "USE_LORA_EPILOGUE"),  # v10 P2
                       (lora_recompute, "USE_LORA_NO_CLONE"),  # v10 P2
                       (merged_qkv, "USE_MERGED_QKV"), (merged_qkv, "MERGED_QKV_CACHE"),  # v11 Q
-                      (merged_qkv, "MERGED_CACHE_MIB")):
+                      (merged_qkv, "MERGED_CACHE_MIB"),
+                      (weight_stream, "USE_WEIGHT_STREAMING"), (head_loss, "STREAM_HEAD"),  # v12 W
+                      (precompile, "_STREAM_INSTALL")):
         monkeypatch.setattr(mod, flag, getattr(mod, flag))
     from solution import mlp
     from solution.kernels import addnorm, head_ce, nf4  # v7 I3 / v8 C1: apply() writes these too
@@ -88,7 +91,8 @@ def recorder(monkeypatch):
                  "USE_BWD_CHUNKING", "BWD_ROW_CHUNKS", "BWD_CHUNK_MIN_ROWS", "K2_VOCAB_TILE",  # M5
                  "USE_ELEMENTWISE_FUSION", "EW_K3_FP16", "EW_LORA_EPILOGUE",  # v10 P2
                  "EW_LORA_NO_CLONE",
-                 "USE_MERGED_QKV", "MERGED_QKV_CACHE", "MERGED_QKV_CACHE_MIB"):  # v11 Q
+                 "USE_MERGED_QKV", "MERGED_QKV_CACHE", "MERGED_QKV_CACHE_MIB",  # v11 Q
+                 "USE_WEIGHT_STREAMING", "STREAM_HEAD"):  # v12 W
         monkeypatch.setattr(solution, flag, getattr(solution, flag))
     return calls, result
 
@@ -365,3 +369,53 @@ def test_q_refuses_fake_objects_without_running_anything(monkeypatch):
         assert merged_qkv.attention_forward(attn, object(), None, (None, None), {}) is None
     assert merged_qkv.COUNTS["merged"] == before["merged"]
     assert merged_qkv.COUNTS["original"] == before["original"] + 3
+
+
+# v12 W: weight streaming, wired as K1 + its own flag (install runs from the first forward through
+# precompile's wrapper); the head half needs K2 and the fp16 store too.
+
+def test_w_default_is_on_and_installs_from_the_first_forward(recorder):
+    calls, _ = recorder
+    assert solution.USE_WEIGHT_STREAMING is True and solution.STREAM_HEAD is True
+    assert weight_stream.USE_WEIGHT_STREAMING is False  # module default: v11 until apply() runs
+    assert head_loss.STREAM_HEAD is False
+    solution.apply()
+    assert weight_stream.USE_WEIGHT_STREAMING is True
+    assert precompile._STREAM_INSTALL is weight_stream.maybe_install
+    assert head_loss.STREAM_HEAD is True
+    assert "forward_join" in calls and calls.index("patch_head_loss") < calls.index("forward_join")
+
+
+def test_w_off_is_v11(recorder, monkeypatch):
+    calls, _ = recorder
+    monkeypatch.setattr(solution, "USE_WEIGHT_STREAMING", False)
+    monkeypatch.setattr(solution, "USE_PRECOMPILE_OVERLAP", False)
+    solution.apply()
+    assert weight_stream.USE_WEIGHT_STREAMING is False
+    assert precompile._STREAM_INSTALL is None
+    assert head_loss.STREAM_HEAD is False  # the head half never runs without the decoder half
+    assert "forward_join" not in calls
+
+
+@pytest.mark.parametrize("case", ["flag_off", "no_k2", "no_fp16_store"])
+def test_w_head_half_needs_k2_and_the_fp16_store(recorder, monkeypatch, case):
+    if case == "flag_off":
+        monkeypatch.setattr(solution, "STREAM_HEAD", False)
+    elif case == "no_k2":
+        monkeypatch.setattr(solution, "USE_HEAD_CE", False)
+    else:
+        monkeypatch.setattr(solution, "STORE_HEAD_FP16", False)
+    solution.apply()
+    assert weight_stream.USE_WEIGHT_STREAMING is True  # the decoder half is independent
+    assert head_loss.STREAM_HEAD is False
+
+
+def test_w_maybe_install_refuses_fake_models_without_raising(monkeypatch):
+    """Soup's tests call forwards on fake modules: the install hook answers False, moves nothing."""
+    monkeypatch.setattr(weight_stream, "USE_WEIGHT_STREAMING", True)
+    before = dict(weight_stream.COUNTS)
+    for model in (object(), type("Fake", (), {"model": None, "config": None})()):
+        assert weight_stream.maybe_install(model) is False
+    assert weight_stream.COUNTS["installed"] == before["installed"]
+    monkeypatch.setattr(weight_stream, "USE_WEIGHT_STREAMING", False)
+    assert weight_stream.maybe_install(object()) is False  # flag off: not even looked at
