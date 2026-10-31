@@ -49,9 +49,13 @@ model so a refusal is not retried. Memory: pinned host 28 x ~25 MiB (~690 MiB, c
 neither nvidia-smi nor torch), GPU 2 x ~25 MiB of slots instead of ~680 MiB of weights.
 
 Expectation (set before the run): nvidia-smi samples the whole process, so the measured peak is
-max(step peak, load transient). Before our install the GPU already holds the NF4 weights, the
-fp32 tied embedding (890 MiB, peft's widening) and bitsandbytes' quantization transients, so the
-peak after v12 is the load transient (~1.7 GB), not the step (~1.35 GB) [estimate].
+max(step peak, every transient before our hooks run). The step drops to ~1.4 GB [estimate]. Before
+our install the GPU holds the NF4 weights (680 MiB) and, while peft's prepare_model_for_kbit_training
+widens the fp16 tied embedding to fp32, both copies (445 + 890 MiB): ~2.1 GB with the context
+[estimate]. head_loss._BEFORE_STORE installs the streamer before the fp16 head store, so that
+store's own transient (fp32 + fp16 head side by side) no longer adds the 680 MiB; the widening
+transient is Soup's / peft's and stays. So expect a peak near 2.1 GB, well above the step, until
+the load path is hooked as well.
 
 Importing this module performs no CUDA work.
 """

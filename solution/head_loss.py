@@ -86,6 +86,12 @@ STORE_HEAD_FP16 = False
 _FP16_MARK = "_soup_delta_fp16_head"
 # v12 W (part 4). solution.apply() sets it (only with STORE_HEAD_FP16, K2 and weight streaming).
 STREAM_HEAD = False
+# v12 W: solution.apply() sets it to weight_stream.maybe_install (once per model, never raises);
+# _maybe_store_head_fp16 calls it on the base model before store_head_fp16, so the decoder's NF4
+# weights (~680 MiB) have left the GPU before the fp16 head copy (445 MiB) sits next to the fp32
+# one (890 MiB) during the lossless check: the store's transient drops by that much. The forward
+# wrapper (precompile._STREAM_INSTALL) still installs when this never ran (no fp16 args, no K2).
+_BEFORE_STORE = None
 # Set on a Parameter whose fp16 copy lives in pinned host memory (= solution/unpad.py _PINNED_MARK).
 _PINNED_MARK = "_soup_delta_pinned_head"
 _EMB_PATCH_MARK = "_soup_delta_pinned_embedding"
@@ -530,6 +536,12 @@ def _maybe_store_head_fp16(trainer, model):
     if base in _HEAD_TRIED:
         return
     _HEAD_TRIED.add(base)
+    before = _BEFORE_STORE  # v12 W: the decoder weights leave the GPU first (see the constant)
+    if before is not None:
+        try:
+            before(base)
+        except Exception:  # noqa: BLE001 - maybe_install never raises; a stand-in might
+            pass
     try:
         stored = store_head_fp16(base)
     except Exception:  # noqa: BLE001 - e.g. out of memory for the copy: keep fp32, train on

@@ -67,7 +67,7 @@ def recorder(monkeypatch):
                       (merged_qkv, "USE_MERGED_QKV"), (merged_qkv, "MERGED_QKV_CACHE"),  # v11 Q
                       (merged_qkv, "MERGED_CACHE_MIB"),
                       (weight_stream, "USE_WEIGHT_STREAMING"), (head_loss, "STREAM_HEAD"),  # v12 W
-                      (precompile, "_STREAM_INSTALL")):
+                      (precompile, "_STREAM_INSTALL"), (head_loss, "_BEFORE_STORE")):
         monkeypatch.setattr(mod, flag, getattr(mod, flag))
     from solution import mlp
     from solution.kernels import addnorm, head_ce, nf4  # v7 I3 / v8 C1: apply() writes these too
@@ -382,6 +382,7 @@ def test_w_default_is_on_and_installs_from_the_first_forward(recorder):
     solution.apply()
     assert weight_stream.USE_WEIGHT_STREAMING is True
     assert precompile._STREAM_INSTALL is weight_stream.maybe_install
+    assert head_loss._BEFORE_STORE is weight_stream.maybe_install  # before the fp16 head store
     assert head_loss.STREAM_HEAD is True
     assert "forward_join" in calls and calls.index("patch_head_loss") < calls.index("forward_join")
 
@@ -392,7 +393,7 @@ def test_w_off_is_v11(recorder, monkeypatch):
     monkeypatch.setattr(solution, "USE_PRECOMPILE_OVERLAP", False)
     solution.apply()
     assert weight_stream.USE_WEIGHT_STREAMING is False
-    assert precompile._STREAM_INSTALL is None
+    assert precompile._STREAM_INSTALL is None and head_loss._BEFORE_STORE is None
     assert head_loss.STREAM_HEAD is False  # the head half never runs without the decoder half
     assert "forward_join" not in calls
 

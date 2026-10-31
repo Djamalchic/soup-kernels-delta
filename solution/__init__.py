@@ -244,8 +244,10 @@ MERGED_QKV_CACHE_MIB = 192
 # streamed weight to its slot view inside nf4_dequantize / k1_dense_path / soup_matmul_4bit, so
 # the fused block, S4, Q and bnb's fallback need no new path. Same bytes, same kernel, same
 # GEMMs: same values. Install is all or nothing (any projection K1 would refuse: nothing moves).
-# ~-630 MiB of static GPU memory at the step; the measured peak then becomes the load transient
-# (~1.7 GB [estimate]: the fp32 tied embedding and bnb's quantization happen before our install).
+# ~-630 MiB of static GPU memory at the step (step peak ~1.4 GB [estimate]); the measured peak is
+# then set by what happens before our hooks run: peft's fp32 widening of the fp16 tied embedding
+# (445 + 890 MiB next to the 680 MiB of NF4 weights, ~2.1 GB with the context [estimate]) and the
+# load itself. Expect nvidia-smi to land near that, not near the step, until those are hooked too.
 # False = v11 exactly.
 USE_WEIGHT_STREAMING = True
 # v12 W part 4 (solution/head_loss.py, kernels/head_ce.py; needs USE_WEIGHT_STREAMING, K2 and
@@ -353,6 +355,8 @@ def _apply_patches():
     streaming = bool(USE_WEIGHT_STREAMING)
     weight_stream.USE_WEIGHT_STREAMING = streaming
     precompile._STREAM_INSTALL = weight_stream.maybe_install if streaming else None
+    # ... and from compute_loss before the fp16 head store, so the store's transient is smaller
+    head_loss._BEFORE_STORE = weight_stream.maybe_install if streaming else None
     head_loss.STREAM_HEAD = False
     if USE_HEAD_CE:                # K2
         head_loss.STORE_HEAD_FP16 = STORE_HEAD_FP16

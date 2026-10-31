@@ -29,6 +29,7 @@ bit-exact with bitsandbytes.functional.dequantize_4bit; our first K1 was 0.289 /
 0.050 / 0.051, bnb's full dequantize_4bit 0.300 / 0.083 / 0.081.
 """
 
+import copy
 import weakref
 
 import torch
@@ -718,14 +719,31 @@ def soup_matmul_4bit(A, B, quant_state, out=None, bias=None):
     # which Linear4bit.forward reaches as `bnb.matmul_4bit`
     # (bitsandbytes/nn/modules.py:637). We only replace bnb's
     # dequant + F.linear path; k1_dense_path decides when that is.
-    # v12: a streamed weight is read from its GPU slot on both paths (bnb's fallback included);
-    # the Function then saves the run-long slot view and the shadow state for its backward.
+    # v12: a streamed weight is read from its GPU slot on both paths. Our Function saves the
+    # run-long slot view and the shadow state and resolves them again in backward (the slot is
+    # refilled and waited on there); bnb's MatMul4Bit saves what it is given and dequantizes it in
+    # backward without asking the streamer, by which time the slot may hold another layer, so it
+    # gets a private copy of the bytes (a few MiB, freed with the node; _private_copy).
+    B_in, qs_in = B, quant_state
     B, quant_state = _streamed(B, quant_state)
     if out is not None or not k1_dense_path(A, B, quant_state):
+        if B is not B_in or quant_state is not qs_in:
+            B, quant_state = _private_copy(B, quant_state)
         return _get_original_matmul_4bit()(
             A, B, quant_state=quant_state, out=out, bias=bias
         )
     return SoupNF4Matmul.apply(A, B, quant_state, bias)
+
+
+def _private_copy(packed, quant_state):
+    """(packed, quant_state) with their own GPU storage: a clone of the slot view and a shadow
+    whose absmax tensors are clones too (code and offset are shared, never written). Issued on
+    the compute stream after resolve waited on the slot, so the bytes are the layer's."""
+    state = copy.copy(quant_state)
+    state.state2 = copy.copy(quant_state.state2)
+    state.absmax = quant_state.absmax.clone()
+    state.state2.absmax = quant_state.state2.absmax.clone()
+    return packed.clone(), state
 
 
 def patch_bnb_matmul_4bit():

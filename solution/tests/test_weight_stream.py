@@ -280,6 +280,32 @@ def test_full_step_same_values_and_less_memory(streamers):
     assert new["held"] <= ref_a["held"] + 2 * s.layout_bytes
 
 
+def test_bnb_fallback_keeps_its_own_bytes(streamers):
+    """m <= 4 sends soup_matmul_4bit to bnb's MatMul4Bit, which saves the weight it was given and
+    dequantizes it in backward without asking the streamer: a streamed weight reaches it as a
+    private copy, so a slot that changed layer in between does not change dX."""
+    model = _build()
+    before = _dequants(model)
+    s = ws.install(model)
+    assert s is not None
+    streamers.append(s)
+    w = ws._base_module(model.model.layers[0], NAMES[3]).weight  # o_proj: no bias
+    dense = before[(0, 3)].float()  # [n, k]
+    n, k = w.quant_state.shape
+    a = torch.randn(2, k, device=DEV, dtype=torch.float16, requires_grad=True)
+    assert not nf4.k1_dense_path(a, w, w.quant_state)  # m = 2: bnb's path
+    out = nf4.soup_matmul_4bit(a, w.t(), w.quant_state)
+    assert out.shape == (2, n) and out.is_cuda
+    torch.testing.assert_close(out.float(), a.detach().float() @ dense.t(), rtol=1e-2, atol=1e-2)
+    s.get(2, 3)  # layer 2 takes slot 0 over layer 0 (every read of layer 0 is issued)
+    torch.cuda.synchronize()
+    assert s.slot_layer[0] == 2
+    out.sum().backward()
+    torch.testing.assert_close(a.grad.float(), torch.ones(2, n, device=DEV) @ dense,
+                               rtol=1e-2, atol=1e-2)
+    assert not w.is_cuda  # the Params4bit itself stayed on the host
+
+
 # ---------------------------------------------------------------------------------------------
 # t4: refusal leaves the model alone
 # ---------------------------------------------------------------------------------------------
