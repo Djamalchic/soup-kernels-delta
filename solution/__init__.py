@@ -112,7 +112,7 @@ USE_LORA_ROW_COMPACT = True  # v6 D (needs U)
 # v6 A: fallback for A1 only. Taken only when USE_SDPA_RECOMPUTE is False (see the docstring).
 USE_SDPA_KV_COMPACT = False
 # K2 part 3: -445 MiB static. Off: "do not change the model" is an open rule question (PLAN Q2).
-STORE_HEAD_FP16 = False
+STORE_HEAD_FP16 = True  # fp16 copy of the tied embedding/lm_head, exact (every value checked on the device); team decision 31.10
 # v7 I4 (needs U): the first int(num_hidden_layers * fraction) packed layers run K3 + K4 without
 # S4's recompute (28 layers -> 7; 2-3-layer test models -> 0). Same values, ~+343 MiB at the peak
 # batch [estimate], less backward work. Kaggle tuning: peak > 3 280 MiB -> 0.215 (6 layers),

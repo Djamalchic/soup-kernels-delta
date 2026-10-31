@@ -150,7 +150,7 @@ def test_defaults_are_the_v6_merge():
     assert solution.USE_FUSED_BLOCK and solution.USE_SDPA_RECOMPUTE
     assert solution.USE_LORA_DROPOUT_REPLAY and solution.USE_LORA_ROW_COMPACT
     assert solution.USE_SDPA_KV_COMPACT is False  # A: fallback for A1 only
-    assert solution.STORE_HEAD_FP16 is False  # open rule question (PLAN Q2)
+    assert solution.STORE_HEAD_FP16 is True  # on since v10c (team decision 31.10)
     # Module defaults of the head store and A stay off until apply() runs.
     assert head_loss.STORE_HEAD_FP16 is False
 
@@ -164,7 +164,7 @@ def test_default_apply_installs_a1_and_never_a(recorder):
     assert saved_compact.USE_LORA_ROW_COMPACT is True
     assert fused_block.USE_FUSED_BLOCK is True
     assert lora_replay.USE_LORA_DROPOUT_REPLAY is True and "a2" in calls
-    assert head_loss.STORE_HEAD_FP16 is False
+    assert head_loss.STORE_HEAD_FP16 is True
     assert mlp_recompute.S4_DEQUANT_REUSE == "both"  # v7 I2
     assert calls.index("u") < calls.index("a1")  # U (and with it A / D's scope) before attention patches
 
