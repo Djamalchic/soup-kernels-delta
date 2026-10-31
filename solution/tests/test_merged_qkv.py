@@ -53,7 +53,7 @@ DEV = "cuda"
 H = tm.H
 KV = tm.KV_HEADS * tm.HEAD_DIM
 LAYERS = 3
-# Tolerances (relative norms) of tests/test_unpad.py and tests/test_v6_merged.py.
+# Tolerances (relative norms) of test_unpad.py and test_v6_merged.py.
 HIDDEN_RTOL, LOSS_RTOL = 5e-3, 1e-4
 
 

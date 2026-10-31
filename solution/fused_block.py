@@ -28,8 +28,8 @@ Extra work per layer in backward: one K3 fwd launch over [N, 1536] and one fp32 
 
 Every value is produced by the same op on the same operands as the unfused path (v6's
 add_rmsnorm with the fp16 delta pointer + S4 MLP + add), so forward outputs and all gradients are
-bit-identical to it (tests/test_peak_v6.py test_fused_block_bit_exact_and_saves_less checks
-torch.equal). Against v5's fp32-pointer K3 launch y/rstd differ by a few fp32 ulp (see
+bit-identical to it (solution/tests/test_peak_v6.py test_fused_block_bit_exact_and_saves_less
+checks torch.equal). Against v5's fp32-pointer K3 launch y/rstd differ by a few fp32 ulp (see
 kernels/addnorm.py). Saving: on layer 0, r (the packed embeddings) has no grad, so no norm keeps
 it in v5, which holds r_mid + x16 there (6 B/elem) while B holds r + a (6 B/elem): no saving on
 layer 0, 27 layers count (~213 MiB, not 221). The

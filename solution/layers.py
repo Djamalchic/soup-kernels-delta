@@ -11,7 +11,7 @@ transformers 5.16.1 models/qwen2/modeling_qwen2.py:
   self_attn exactly as at lines 282-290, and the return value is the same single tensor.
 
 Guards: exact module types; no hooks or instance-level forward on the norm we bypass (the hook
-checks follow the GPT-6-Astra K3 draft); CUDA fp32 residual of width 1536; frozen fp32 weights;
+checks follow a GPT-6-Astra K3 draft); CUDA fp32 residual of width 1536; frozen fp32 weights;
 delta of the same shape in fp16/fp32. Otherwise the original forward runs. Nothing touches CUDA at
 import or at patch time. Both patches are idempotent and keep the original in __wrapped__ (same
 convention as solution/mlp.py).

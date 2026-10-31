@@ -13,7 +13,7 @@ and a reference to the mask (one tensor shared by all layers, created once per f
 create_causal_mask). In backward it repeats k and v again, runs the same SDPA call once more with
 grad enabled and lets torch's own SDPA backward produce the gradients. Saving per layer:
 ~8 KiB per padded token + the bias = ~18 MiB at B*T = 2048 [estimate]; cost: one extra SDPA
-forward per layer in backward (~5 % of the base step is attention in total, tz.md s.2).
+forward per layer in backward (attention is ~5 % of a base step in the task's profile, README).
 
 Why the numbers are the base numbers:
 - forward: under fp16 autocast base SDPA sees fp16(q), fp16(repeat_kv(k)), fp16(repeat_kv(v)).
@@ -56,8 +56,8 @@ Idea credit: activation recomputation (Chen et al. 2016, arXiv:1604.06174) appli
 core only, as in Korthikanti et al. 2022 "Reducing Activation Recomputation in Large Transformer
 Models" (arXiv:2205.05198, selective recomputation). Code written from scratch.
 
-v7 I1, causal-only SDPA on U's packed path (USE_CAUSAL_PADDED, off unless solution.apply() sets
-it). solution/unpad.py builds the [B, 1, T, T] bool mask with transformers' genuine
+v7 I1, causal-only SDPA on U's packed path (USE_CAUSAL_PADDED; module default off, solution.apply()
+turns it on). solution/unpad.py builds the [B, 1, T, T] bool mask with transformers' genuine
 create_causal_mask from a 2D mask it has validated on the device as binary, right-padded and with a
 real first token in every row (unpad.py _row_indices), and enters `causal_mask_scope(mask)` around
 its layer loop. With no or/and mask function, no block ids and a 2D mask (so no packed-sequence
@@ -75,7 +75,7 @@ Only the exact mask object entered by U qualifies (identity / same storage, shap
 other mask, a sliding window, or the flag off runs the v6.1 dense-mask call. GQA stays on
 repeat_kv (no enable_gqa: the sm75 mem-efficient path must not fall back to math).
 
-v9 M3, real rows only (USE_ROW_COMPACT, off unless solution.apply() sets it). On U's packed path
+v9 M3, real rows only (USE_ROW_COMPACT; default off, apply() turns it on). On U's packed path
 (solution/unpad.py _row_scope enters `row_compact_scope(mask, idx, batch, seq)` around its layer
 loop, for the same provenance-checked mask as I1) `_SDPARecompute` saves q16 / k16 / v16 as
 [N, heads, 128] gathers of the real rows (idx = U's flat row index, N real tokens) instead of the

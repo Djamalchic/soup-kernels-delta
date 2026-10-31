@@ -1,4 +1,7 @@
-"""Run from the repository root with: python -m pytest solution/tests/test_nf4.py"""
+"""K1: bit-exactness against bitsandbytes, guards and fallback, the validation cache and I3.
+
+Run from the repository root with: python -m pytest solution/tests/test_nf4.py
+"""
 
 import pytest
 import torch
@@ -326,7 +329,7 @@ def test_patch_is_idempotent(monkeypatch):
     assert nf4._get_original_matmul_4bit() is saved_original
 
 
-# --- K1 v3s: kernel layout limits, fallback, validation cache, rules -------
+# --- K1: kernel layout limits, fallback, validation cache, rules ------------
 
 # (3, 40): 120 elements, one program with 15 of its 256 rows live and a
 # partial 64-block. (1, 8): a single 4-byte group. (5, 1536): partial program.
@@ -485,8 +488,8 @@ def _count_launches(monkeypatch):
 @pytest.mark.parametrize("fast", (False, True))
 def test_i3_aliases_hit_the_validation_cache(quantized_weights, monkeypatch, fast):
     """D hands SoupNF4Matmul.backward a `t.detach()` alias (saved_compact.py:126) and S4 a
-    `weight.view(-1, 1)` (mlp_recompute.py:226). v6.1 (fast=False) re-validated every alias AND
-    then the real weight (the alias evicted its record); I3 validates once."""
+    `weight.view(-1, 1)` (mlp_recompute._dequantize_weight). v6.1 (fast=False) re-validated every
+    alias AND then the real weight (the alias evicted its record); I3 validates once."""
     monkeypatch.setattr(nf4, "USE_K1_FAST_HOST", fast)
     monkeypatch.setattr(nf4, "USE_DENSE_CACHE", False)
     packed, state = quantized_weights[(1536, 1536)]  # never in the dense cache anyway

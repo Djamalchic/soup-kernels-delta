@@ -2,9 +2,9 @@
 
 CUDA only (Kaggle T4). Run from the repository root: python -m pytest solution -q
 (add -s to see the measured peaks). The wiring and the chunk boundaries are tested without a GPU
-in tests/test_v6_apply.py (test_m5_flags_reach_the_modules, test_m5_row_bounds).
+in test_v6_apply.py (test_m5_flags_reach_the_modules, test_m5_row_bounds).
 
-What has to hold before the flag stays on:
+M5 is off in the submitted run (USE_BWD_CHUNKING = False); these tests keep its path correct:
 - S4 "rows" is NOT bit-identical to "both" in general: the u GEMM runs with M = chunk rows instead
   of N, and cuBLAS picks its kernel per (m, n, k). Kaggle T4 (31.10): equal bits at N = 600, 1350,
   1351, 2048 (helper), 1400 (SoupMLPRecompute on [2, 700, C]) and 1350 / 2000 (fused block B), but
@@ -90,7 +90,7 @@ def _both_with_chunked_u(mlp, x16, dh, bounds):
     return dx
 
 
-def _rel(a, b):  # tests/test_unpad.py rel(): relative error in the Frobenius norm
+def _rel(a, b):  # test_unpad.py rel(): relative error in the Frobenius norm
     return ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-30)).item()
 
 
@@ -101,8 +101,8 @@ def _assert_rows_close_to_both(got, ref, label):
     read u (kernels/swiglu.py soup_swiglu_kernel: du = dh * g * s), dgate moves by the same few
     ulps, and dx = dg W_gate + du W_up by less (and by its own final rounding). Bounds already used
     for S4 input gradients and LoRA gradients: element-wise rtol 2e-3, atol 2e-3 * max|ref|
-    (tests/test_mlp_recompute.py test_torch_swiglu_path_close_to_k4, where dgate / dup also differ
-    by single fp16 ulps), and the relative norm within GRAD_RTOL = 2e-2 (tests/test_peak_v6.py). A
+    (test_mlp_recompute.py test_torch_swiglu_path_close_to_k4, where dgate / dup also differ
+    by single fp16 ulps), and the relative norm within GRAD_RTOL = 2e-2 (test_peak_v6.py). A
     chunk-boundary bug moves whole rows of dx by O(1) and fails both.
     """
     assert got.dtype == ref.dtype and got.shape == ref.shape, label

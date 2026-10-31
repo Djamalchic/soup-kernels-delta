@@ -1,4 +1,4 @@
-"""A + D (v6 peak-timing): smaller saved tensors inside the attention of a packed decoder layer.
+"""A + D (v6): smaller saved tensors in a packed layer's attention (D is on; A, A1's fallback, off).
 
 Where the v5 peak comes from [estimate, from the v4 -> v5 difference and the shapes below]: at the
 start of backward autograd still holds, per decoder layer, about 62 MiB at B*T = P = 2048 rows
@@ -43,7 +43,7 @@ D. LoRA dropout masks and LoRA-A inputs on the padding rows (context around self
    - every other tensor saved in there has another shape (SDPA 4-D [B, 12, T, 128], LoRA-B's
      [P, 16], RoPE's cos/sin, K1's packed uint8 weights) and is kept as a detached alias of
      itself (same storage; never the tensor itself, see _row_hooks: v6 fix). bitsandbytes'
-     MatMul4Bit and K1 keep no activation (`_functions.py:356-359`, `kernels/nf4.py:408`).
+     MatMul4Bit and K1 keep no activation (`_functions.py:356-359`, `SoupNF4Matmul.forward`).
    Saves 6 (P - N) x 1536 bytes per layer: ~6.1 MiB at P = 2048, N = 1350 -> ~172 MiB [estimate].
 
 Cost [estimate]: A two 1 MiB slices in forward and two 6 MiB repeats in backward per layer; D four
@@ -63,7 +63,7 @@ import functools
 
 import torch
 
-USE_SDPA_KV_COMPACT = False  # A; solution.apply() switches it on
+USE_SDPA_KV_COMPACT = False  # A, A1's fallback: apply() switches it on only if A1 is not installed
 USE_LORA_ROW_COMPACT = False  # D; solution.apply() switches it on
 
 _MARK = "_soup_delta_sdpa_kv_compact"

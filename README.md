@@ -5,7 +5,7 @@
 > - **Kernels.** Five of ours: NF4 dequant, LM head + cross entropy, add + RMSNorm forward and backward, SwiGLU; one launcher.
 > - **What is new.** No [B, T, V] logits, no padding in token-wise ops, backward tensors recomputed or kept on real rows, compile overlapped with model loading, q, k, v as one GEMM.
 > - **Verify.** Copy the notebook [TODO final link] with `COMMIT = "[TODO final commit]"` and click Run All.
-> - **Code.** https://github.com/BAITC-Hacks/hack-8cddb4ae-delta, code v11 = `f218f86`; the final commit [TODO final commit] adds only this README and `SUBMISSION.md`.
+> - **Code.** https://github.com/BAITC-Hacks/hack-8cddb4ae-delta, code v11 = `f218f86`; the final commit [TODO final commit] changes only documentation.
 
 ## 1. What we did and why
 
@@ -94,7 +94,7 @@ ChatGPT (GPT-6-Astra) and Claude were used as coding assistants, as the rules al
      ```
    - `check_rules.py` prints ten `PASS` lines, then `ALL CHECKS PASSED`.
    - `score.py` ends with `all checks passed on this result: True`.
-7. Run All took about 12 minutes for v10b, plus queueing; later times are not in our notes.
+7. Run All took about 12 minutes for v10b, plus queueing.
 8. Variants: in `solution/__init__.py`, `USE_MERGED_QKV = False` gives v10d, plus `USE_PRECOMPILE_OVERLAP = False` v10c, plus `STORE_HEAD_FP16 = False` v10b, plus `USE_ELEMENTWISE_FUSION = False` v9b. Push a branch and put its commit in `COMMIT`.
 
 ## 3. Results and limitations
@@ -168,3 +168,7 @@ Each pair reads without, then with the change.
 - **Host code**: the GPU idles about 100 to 180 ms per step in Soup and TRL code (logging, rewind, NaN checks, optimizer), and at v8b our compile made step 1 take 3.5 s against 1.8 s, which v10d only overlaps with model loading.
 - **Not bit-equal to the base**: K3, A1 and Q change last bits and A1's backward may be nondeterministic, yet eval loss stayed within 0.003% of the base in every full run.
 - **Scope**: Soup's T4 fp16 path and Qwen2 only; under bf16, K1, K4, S4 and B fall back to the original code and the head stays fp32 unless fp16-exact; other GPUs and models are untested.
+
+## 4. Repository map
+
+`solution/` is our code: `__init__.py` (`apply()`, every flag), `kernels/` (Triton), `tests/`; `swiglu.py` and `test_kernels.py` are the starter kit's example, unchanged. `VERSIONS.md`: every version's branch, flags, component names. `harness/`, `tests/`, `task/`, `templates/`, `NOTICE` and `LICENSE` (Apache-2.0) are the starter kit, unchanged.

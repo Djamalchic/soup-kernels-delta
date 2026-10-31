@@ -1,12 +1,12 @@
 """K2 part 3 (STORE_HEAD_FP16) on the real-width stack, and K2's own cost with an fp16 head.
 
-Why (v9 H16): the Kaggle bench of 31.10 (log12) ran v8b, then v8b with STORE_HEAD_FP16 = True
+Why: a Kaggle bench of 31.10 (notebook version 12) ran v8b, then v8b with STORE_HEAD_FP16 = True
 twice, in that order: median step 0.5985, 0.6285, 0.6509 s. The suspected cause was an fp16
 residual stream: nn.Embedding on the fp16 weight returns fp16, K3's norm_ok wants fp32
-(kernels/addnorm.py:242) and B's fused_ok calls it (fused_block.py:151), so every norm and every B
+(kernels/addnorm.py) and B's fused_ok calls it (fused_block.py), so every norm and every B
 node would take the slow path. The code does not let that happen: store_head_fp16 registers
-_embedding_output_to_fp32 on embed_tokens (head_loss.py:453-461, registered at :519 before the
-storage swap) and U calls embed_tokens as a module (unpad.py:484; base too, modeling_qwen2.py:356),
+_embedding_output_to_fp32 on embed_tokens (head_loss.py, registered before the
+storage swap) and U calls embed_tokens as a module (unpad.py; base too, modeling_qwen2.py:356),
 so the hook widens the rows before pack_rows. Test 1 proves it on the device, through the patched
 SFTTrainer.compute_loss as the run reaches it: with the flag on, every packed layer gets and returns
 an fp32 residual, K3 launches exactly the kernels of the flag-off step, B fires on every layer, U
@@ -204,7 +204,7 @@ def test_fp16_head_keeps_the_fp32_residual_and_every_fast_path(v6_patches, monke
         stored = head_loss.HEAD_FP16_COUNTS["stored"]
 
         monkeypatch.setattr(head_loss, "STORE_HEAD_FP16", True)
-        new = _step(pm, batch, probe)  # stores before its forward (head_loss.py:603)
+        new = _step(pm, batch, probe)  # stores before its forward (head_loss.compute_loss_impl)
         again = _step(pm, batch, probe)  # once per model
     finally:
         torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = reduced

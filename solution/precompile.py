@@ -3,7 +3,7 @@
 Why. Every measured run starts with an empty Triton cache (harness/run_task.py:109 gives each run
 its own TRITON_CACHE_DIR), so in v10c each kernel compiles at its first launch, one after the other,
 inside training step 1: cuda_utils (gcc), the five kernels (Python frontend, MLIR, LLVM, ptxas) and
-the one launcher they share (gcc, v8 C1). Kaggle T4, version 18: step_s[0] 3.71 s against 1.03 s
+the one launcher they share (gcc, v8 C1). Notebook version 18 (T4): step_s[0] 3.71 s against 1.03 s
 when the same compiles ran before step 1. v10 P1 ran them in a pool joined inside apply(): apply_s
 went 7.79 -> 10.53 s and the wall did not move (the Triton frontend and apply()'s imports both hold
 the GIL). Here they run after apply() has returned, overlapping what Soup does between apply() and
@@ -50,8 +50,8 @@ timing is also off before step 3, :149). Check 3 only needs a count > 0 (check_r
 and these five kernels launch on every step anyway; check 4 reads own_kernel_ms, which warmup never
 enters.
 
-Triton API. No Triton source on the team's machines; the calls below are those of v10 P1, which ran
-on the Kaggle T4 with Triton 3.6.0 (version 18: solution/tests/test_precompile.py passed, step_s[0]
+Triton API (not checked against the Triton source): the calls below are those of v10 P1, which ran
+on the Kaggle T4 with Triton 3.6.0 (notebook version 18: our test_precompile.py passed, step_s[0]
 3.71 -> 1.03 s, i.e. no compile left at the first launch): `JITFunction.warmup(*args, grid,
 **kwargs)` (= `run(..., warmup=True)`: compiles on a key miss, caches, returns the kernel without
 launching), `triton.runtime.jit.MockTensor(dtype)`, `triton.runtime.driver.driver.active`
@@ -90,7 +90,7 @@ def kernel_specs(addnorm=True, head_ce=True, swiglu=True, ew_k3=False):
     - K1 kernels/nf4.py:482-494 (signature :188-194): packed u8, absmax u8, state2.absmax f32,
       state2.code f32, offset f32, out (int32 view), out again (spare); n_groups, 0, 0, 0 (all
       do_not_specialize); 0.0; num_warps=_NUM_WARPS, enable_fp_fusion=False.
-    - with ew_k3 (v10 P2; v10c runs this way, EW_K3_FP16 on), the K3 pair the run launches:
+    - with ew_k3 (v10 P2, on in the submitted run: EW_K3_FP16), the K3 pair the run launches:
       fwd v10 (signature kernels/addnorm.py:163-168, every int and the float in do_not_specialize),
       launched at :327-332 (norm, modes 0 / 1), :403-408 (LoRA epilogue, mode 2) and :426-431 (its
       backward, mode 3): X f32 (x / out / g), D fp16 (delta, dummy, base16, g16), W f32 (weight /

@@ -396,7 +396,7 @@ def test_lora_epilogue_refuses_odd_operands():
 @pytest.mark.parametrize("r_grad", [True, False])
 def test_m2_pair_with_p2_matches_v8b_bit_for_bit(patched, monkeypatch, k3_flags, epilogue, ew_k3,
                                                  r_grad):
-    """tests/test_lora_recompute.py's pair (q and v widths, scaling 32 / 16 = 2.0): M2 with the
+    """test_lora_recompute.py's pair (q and v widths, scaling 32 / 16 = 2.0): M2 with the
     v10 P2 flags against the v8b LoRA path. Both runs use the same K3 entries (ew_k3), so the norm
     in front is the same; (False, False) is the clone skip alone."""
     addnorm.USE_EW_K3 = ew_k3

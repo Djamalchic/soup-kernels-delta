@@ -2,6 +2,7 @@
 
 No GPU and no real patching: the patch functions are monkeypatched, so this only checks the wiring
 in solution/__init__.py (A1 and A are never both installed, A2 / B / D / head flags as documented).
+Named after the version that introduced these tests; they check the current defaults and wiring.
 Run from the repository root: python -m pytest solution -q
 """
 
@@ -161,7 +162,7 @@ def test_defaults_are_the_v6_merge():
     assert solution.USE_FUSED_BLOCK and solution.USE_SDPA_RECOMPUTE
     assert solution.USE_LORA_DROPOUT_REPLAY and solution.USE_LORA_ROW_COMPACT
     assert solution.USE_SDPA_KV_COMPACT is False  # A: fallback for A1 only
-    assert solution.STORE_HEAD_FP16 is True  # on since v10c (team decision 31.10)
+    assert solution.STORE_HEAD_FP16 is True  # on since v10c (the organisers' answer of 31.10)
     # Module defaults of the head store and A stay off until apply() runs.
     assert head_loss.STORE_HEAD_FP16 is False
 

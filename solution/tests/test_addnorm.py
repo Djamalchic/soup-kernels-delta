@@ -2,7 +2,7 @@
 frozen fp32 weights) in outputs, dtypes and gradients, and falls back on anything unexpected.
 Every reference is computed on the unpatched classes before our patches are installed.
 
-The real-attention decoder test and the spy-based fallback test are adapted from the GPT-6-Astra
+The real-attention decoder test and the spy-based fallback test are adapted from a GPT-6-Astra
 K3 draft. Run from the repository root: python -m pytest solution -q
 """
 

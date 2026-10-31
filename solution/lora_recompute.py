@@ -8,7 +8,7 @@ modeling_qwen2.py:206/208), so every layer keeps two such tensors: 6 KiB per rea
 (saved_compact.py), 221 MiB at N = 1350 over 28 layers [estimate: 2 x 1350 x 1536 x 2 B x 28].
 
 What it keeps instead. x_bt = unpack_rows(input_layernorm(r)) (unpad._layer_packed), and r (fp32
-[N, 1536]) is already kept by that very norm (kernels/addnorm.py:200, _RMSNorm saves x) and by B
+[N, 1536]) is already kept by that very norm (kernels/addnorm.py: _RMSNorm saves x) and by B
 (fused_block.py, layer 0 included). The LoRA-A input is therefore a pure function of tensors that
 are alive anyway plus the dropout's generator state:
     d16 = fp16(dropout_state(unpack_rows(norm(r))))
@@ -24,8 +24,8 @@ from the kept tensor; nothing else in the graph changes.
 
 The fp16 cast is done by us (`dropped.to(torch.float16)`) instead of inside autocast: autocast's
 cast of an fp16 input is a no-op and of an fp32 non-leaf is `arg.to(fp16)`, the same ToCopy node
-[from memory, aten/src/ATen/autocast_mode.cpp cached_cast; torch source is not on disk]. The test
-checks forward and gradients bit for bit against peft on one layer.
+(our reading of cached_cast in aten/src/ATen/autocast_mode.cpp, not checked against the source).
+solution/tests/test_lora_recompute.py checks forward and gradients bit for bit against peft.
 
 Pair rebuild: the first unpack in a layer rebuilds x_bt once and draws every pending recipe of that
 layer (q and v), keeping the others in a per-layer stash until their own unpack (one fp16
@@ -50,7 +50,7 @@ makes itself, nn/modules.py:626-628) and `f32(base16) + f32(fp16(lora_B(h) * s))
 (_LoraEpilogue, kernels/addnorm.py modes 2 / 3) instead of `.to(fp32)`, clone, mul, add and two
 casts + a mul in backward. Taken only for an exact fp16-compute bnb Linear4bit base and an
 fp16-exact scaling (the task's 32 / 16 = 2.0); anything else keeps the ops above. Same bits
-(tests/test_ew_fusion.py: the LoRA pair against v8b, torch.equal).
+(solution/tests/test_ew_fusion.py: the LoRA pair against v8b, torch.equal).
 
 Idea credit: selective activation recomputation (Korthikanti et al. 2022, arXiv:2205.05198) and
 torch.utils.checkpoint's RNG-state replay; code written from scratch. Fusing a LoRA output

@@ -18,6 +18,7 @@ fail on the old code:
   a step does not grow. The old code leaks ~2 x 7.6 MB per step here (3 x 1.8 MB k/v/out + bias +
   lse per layer, rows = 600).
 
+Named after the version that introduced these tests; they run against the current code.
 CUDA only (Kaggle T4). Run from the repository root: python -m pytest solution -q
 """
 
@@ -310,7 +311,7 @@ def _cached_kv_match_fresh_dequant(pm):
     """Every cached k/v weight against a fresh K1 dequant of the same Params4bit, bit for bit.
 
     The cache key is id(quant_state) of the weight Linear4bit.forward hands to bnb.matmul_4bit
-    (bitsandbytes/nn/modules.py:611, :637; kernels/nf4.py:503). v_proj is peft's LoRA wrapper;
+    (bitsandbytes/nn/modules.py:611, :637; nf4.nf4_dequantize). v_proj is peft's LoRA wrapper;
     its bnb layer is get_base_layer() (peft tuners/tuners_utils.py:1438, lora/layer.py:125).
     The fresh call runs with the cache off, on the Params4bit that owns the _VALID record (the
     forward validated it), so it neither reads nor changes the cache. Returns the count."""

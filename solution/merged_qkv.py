@@ -9,7 +9,7 @@ forward (N = 1536, 256, 256 against K = 1536) and three dX GEMMs in backward, th
 casts of x, three fp16 -> fp32 casts of their input gradients and five gradient contributions
 summed into x's gradient (q base, q LoRA, k, v base, v LoRA). N = 256 fills a T4 poorly
 (2 x 16 output tiles of 128 x 128 at P = 2048 rows for 40 SMs [estimate: cuBLAS's tile choice is
-not known here]; profile v8b/F2: GEMMs ~300 of ~460 ms GPU per step).
+not known here]; a T4 profile of v8b: GEMMs ~300 of ~460 ms GPU per step).
 
 What runs instead (only on U's packed path, inside unpad._layer_packed's attention scopes):
 - x16 = x.to(fp16) once (the same cast, now one autograd node instead of three);
@@ -30,13 +30,13 @@ What runs instead (only on U's packed path, inside unpad._layer_packed's attenti
 W_qkv rows are bit-identical to the per-projection weights: the q rows come from K1's dequant
 (nf4_dequantize with out= into the buffer, bit-exact with bitsandbytes), the k / v rows from the
 same K1 dequant (I3's dense cache when it holds them, else K1 into the buffer).
-- MERGED_QKV_CACHE False (default): W_qkv is built per call (forward and backward): one K1 launch
-  for q (as today), two 0.75 MiB copies from I3's k / v cache. Static memory unchanged; the
-  transient weight buffer is 6 MiB instead of q's 4.5 MiB.
-- MERGED_QKV_CACHE True: W_qkv is kept for the run (28 x 6 MiB = 168 MiB on Qwen2.5-1.5B), and
-  I3's k / v entries become views into it (k / v are not stored twice): +126 MiB static over
-  I3's 42 MiB [arithmetic: 28 x 1536 x 1536 x 2 B = 126 MiB], two K1 launches per layer per step
-  fewer. Capped at MERGED_CACHE_MIB; above it the call builds per call.
+- MERGED_QKV_CACHE False (default, as submitted): W_qkv is built per call (forward and backward):
+  one K1 launch for q (as in v10d), two 0.75 MiB copies from I3's k / v cache. Static memory
+  unchanged; the transient weight buffer is 6 MiB instead of q's 4.5 MiB.
+- MERGED_QKV_CACHE True (off, not measured): W_qkv is kept for the run (28 x 6 MiB = 168 MiB on
+  Qwen2.5-1.5B), and I3's k / v entries become views into it (k / v are not stored twice):
+  +126 MiB static over I3's 42 MiB [arithmetic: 28 x 1536 x 1536 x 2 B = 126 MiB], two K1 launches
+  per layer per step fewer. Capped at MERGED_CACHE_MIB; above it the call builds per call.
 
 Numerics (NOT bit-identical; stated plainly):
 - forward: every q / k / v element is still round_fp16(sum_k x16 * W + b) of the same fp16
@@ -44,13 +44,13 @@ Numerics (NOT bit-identical; stated plainly):
   element may land on the neighbouring fp16 value (1 ulp, 2**-11 relative) when the fp32
   accumulation order differs. Everything after it runs the same ops.
 - backward: dX16 = round_fp16(gq @ Wq + gk @ Wk + gv @ Wv) accumulated in fp32 inside one GEMM and
-  rounded once, where today each term is rounded to fp16 on its own and the three are summed in
-  fp32 by autograd; x's gradient then sums 3 contributions instead of 5 (another fp32 order).
-  Overflow: the merged dX16 is inf where the SUM exceeds 65504; today a term is inf only where it
+  rounded once, where v10d rounds each term to fp16 on its own and autograd sums the three in
+  fp32; x's gradient then sums 3 contributions instead of 5 (another fp32 order).
+  Overflow: the merged dX16 is inf where the SUM exceeds 65504; in v10d a term is inf only where it
   alone does (the fp32 sum of three finite terms may exceed it). The sum is dominated by the q
   term, so the window is narrow, but a GradScaler skip could come one scale step earlier.
 - RNG: identical stream (same draws, same order, nothing new draws).
-Tolerances in tests/test_merged_qkv.py are those of tests/test_unpad.py / test_v6_merged.py: hidden
+solution/tests/test_merged_qkv.py uses the tolerances of test_unpad.py / test_v6_merged.py: hidden
 5e-3, loss 1e-4, LoRA gradients 2e-2 (relative norms); the RNG state bit for bit.
 
 Guards (all read-only; any miss -> None and unpad makes the usual module call): flag on and
@@ -79,8 +79,8 @@ import torch.nn.functional as F
 
 from .lora_recompute import _compiling, _fp16_autocast, _hookless, _no_global_hooks
 
-USE_MERGED_QKV = False  # read on every call; solution.apply() sets it
-MERGED_QKV_CACHE = False  # True: keep W_qkv for the run (+126 MiB on Qwen2.5-1.5B)
+USE_MERGED_QKV = False  # read on every call; solution.apply() sets it (on as submitted)
+MERGED_QKV_CACHE = False  # off as submitted; True keeps W_qkv for the run (+126 MiB on 1.5B)
 MERGED_CACHE_MIB = 192  # cap of the W_qkv cache (28 x 6 MiB = 168 MiB)
 
 # (n_q, n_k, n_v, hidden): Qwen2.5-1.5B (12 x 128, 2 x 128, 2 x 128, 1536)

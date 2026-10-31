@@ -70,13 +70,13 @@ _FP16_MARK = "_soup_delta_fp16_head"
 _STORE_CHUNK_ROWS = 8192
 # Models store_head_fp16 already looked at (one attempt each; a refusal costs a sync and a copy).
 _HEAD_TRIED = weakref.WeakSet()
-# "stored" / "refused" attempts; tests and a debug notebook read it.
+# "stored" / "refused" attempts; tests read it.
 HEAD_FP16_COUNTS = {"stored": 0, "refused": 0}
 
 _log = logging.getLogger(__name__)
 _warned = {"fallback": False}
 # Steps that took our compute_loss: "fused" = logits-free head, "logits" = the model declined.
-# Nothing prints it; tests and a debug notebook read it to prove the fused path ran.
+# Nothing prints it; tests read it to prove the fused path ran.
 COUNTS = {"fused": 0, "logits": 0}
 
 # Set (to a fresh holder) only inside our compute_loss, around Trainer.compute_loss.
