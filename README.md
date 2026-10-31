@@ -5,7 +5,7 @@
 > - **Kernels.** Five of ours: NF4 dequant, LM head + cross entropy, add + RMSNorm forward and backward, SwiGLU; one launcher.
 > - **What is new.** No [B, T, V] logits, no padding in token-wise ops, backward tensors recomputed or kept on real rows, compile overlapped with model loading, q, k, v as one GEMM.
 > - **Verify.** Copy the notebook https://www.kaggle.com/code/jamildeltacaptain/notebook0289d149f3 (its saved version already has `COMMIT` set to the final commit, tag `submission`) and click Run All.
-> - **Code.** https://github.com/BAITC-Hacks/hack-8cddb4ae-delta, code v11 = `f218f86`; the final commit (tag `submission` = `6376c0a`, https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/tree/submission, the commit the notebook ran) changes only documentation, and the one docs commit after it only writes the saved version's numbers into this README and SUBMISSION.md.
+> - **Code.** https://github.com/BAITC-Hacks/hack-8cddb4ae-delta, public mirror with the same commits and tag https://github.com/Djamalchic/soup-kernels-delta, code v11 = `f218f86`; the final commit (tag `submission` = `6376c0a`, https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/tree/submission, the commit the notebook ran) changes only documentation, and the one docs commit after it only writes the saved version's numbers into this README and SUBMISSION.md.
 
 ## 1. What we did and why
 
@@ -69,7 +69,7 @@ ChatGPT (GPT-6-Astra) and Claude were used as coding assistants, as the rules al
 
 ## 2. How to run
 
-1. Open the public notebook https://www.kaggle.com/code/jamildeltacaptain/notebook0289d149f3 and click Copy & Edit. GPU and Internet need a phone-verified Kaggle account.
+1. Open the public notebook https://www.kaggle.com/code/jamildeltacaptain/notebook0289d149f3 and click Copy & Edit. If the organizers' repository is private for you, set `REPO_URL` to the public mirror https://github.com/Djamalchic/soup-kernels-delta.git: it holds the same commits and the tag `submission`. GPU and Internet need a phone-verified Kaggle account.
 2. Set Accelerator to **GPU T4 x2** and switch **Internet on**.
 3. In the first code cell, check `REPO_URL = "https://github.com/BAITC-Hacks/hack-8cddb4ae-delta.git"` and `COMMIT` is the final commit (the hash of tag `submission`, shown at https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/tree/submission).
 4. Click Run > Restart & clear cell outputs. Add no GPU cells of your own: check 9 needs idle GPUs.

@@ -1,7 +1,7 @@
 # Submission: Team Delta
 
 ## Links
-- Repository, final commit: tag `submission`, https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/tree/submission (the commit hash is shown on that page and in the notebook's first cell)
+- Repository, final commit: tag `submission`, https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/tree/submission; public mirror with the same commits and tag: https://github.com/Djamalchic/soup-kernels-delta/tree/submission (the commit hash is shown on that page and in the notebook's first cell)
   - Code v11 = commit `f218f86`, branch `v11-candidate`. The final commit changes only documentation: README.md, this file, VERSIONS.md (every version's branch), and comments and docstrings in solution/.
   - Lineage: v9b `91d70d3` + P2 = v10b `69b0c95`; + `STORE_HEAD_FP16 = True` = v10c `0b9e562`; + compile overlap = v10d `6b56d31`; + Q, the merged q, k, v GEMM = v11 `f218f86`.
 - Public Kaggle notebook, saved version with `COMMIT` = the final commit, also linked in README.md: https://www.kaggle.com/code/jamildeltacaptain/notebook0289d149f3
