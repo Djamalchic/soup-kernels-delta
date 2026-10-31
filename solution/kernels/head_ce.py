@@ -57,6 +57,7 @@ import triton
 import triton.language as tl
 
 # v10d: precompile.wait() joins a pending background compile (a module-global None check after it)
+from .. import host_weights as _host
 from .. import precompile as _precompile
 
 IGNORE_INDEX = -100
@@ -224,6 +225,11 @@ def _weight_tiles(weight, H, device):
     """(fp16 tile getter, weight buffer or None). An fp16 head is sliced, an fp32 one is cast by
     mode 2 into one reused buffer. Any other dtype is refused (head_loss guards allow these two)."""
     w = weight.detach()
+    src = _host.host_source(w)
+    if src is not None:  # v12 H: the head lives in host memory; one GPU tile buffer, refilled
+        wbuf = torch.empty((min(VOCAB_TILE, w.shape[0]), H), dtype=torch.float16, device=device)
+        return (lambda v0, nv, target, state:
+                wbuf[:nv].copy_(src[v0:v0 + nv], non_blocking=True)), wbuf
     if w.dtype == torch.float16:
         return (lambda v0, nv, target, state: w[v0:v0 + nv]), None
     if w.dtype != torch.float32:

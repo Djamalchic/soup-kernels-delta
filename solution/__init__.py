@@ -106,12 +106,15 @@ summed in fp32 inside the GEMM and rounded once (solution/tests/test_merged_qkv.
 """
 
 from . import fused_block, head_loss, lora_recompute, lora_replay, merged_qkv, mlp, mlp_recompute
-from . import precompile, saved_compact, sdpa_recompute, unpad
+from . import host_weights, precompile, saved_compact, sdpa_recompute, unpad
 from .head_loss import patch_head_loss
 from .kernels.nf4 import patch_bnb_matmul_4bit
 from .layers import patch_qwen2_decoder_layer, patch_qwen2_rmsnorm
 from .mlp import patch_qwen2_mlp_fp16
 
+# v12 H (solution/host_weights.py): the frozen NF4 weights and the tied embedding / lm_head live in
+# pinned host memory and are read by the GPU over PCIe (UVA); the same bytes, ~-1.1 GiB of GPU memory.
+HOST_WEIGHTS = True
 USE_ADDNORM = True        # K3
 USE_UNPAD = True          # U
 USE_MLP_RECOMPUTE = True  # S4
@@ -148,7 +151,7 @@ S4_OFF_FRACTION = 0.0
 # DENSE_CACHE: k_proj / v_proj keep their fp16 dequant for the run (2 x 28 x 0.75 MiB = 42 MiB on
 # Qwen2.5-1.5B), capped at DENSE_CACHE_MIB; DENSE_CACHE_QO adds q/o (+252 MiB, off).
 USE_K1_FAST_HOST = True
-USE_DENSE_CACHE = True
+USE_DENSE_CACHE = False  # v12: off, its 42 MiB stayed on the GPU
 DENSE_CACHE_QO = False
 DENSE_CACHE_MIB = 64
 
@@ -259,6 +262,8 @@ def _apply_patches():
     # nf4 and head_ce are imported above (K1 patch, head_loss); addnorm loads here. Importing a
     # kernel module only defines Triton functions: no CUDA work, no compile.
     from .kernels import addnorm as _k3, head_ce as _k2, nf4 as _nf4
+    if HOST_WEIGHTS:
+        host_weights.install()
 
     _nf4.USE_K1_FAST_HOST = USE_K1_FAST_HOST  # I3
     _nf4.USE_DENSE_CACHE = USE_DENSE_CACHE

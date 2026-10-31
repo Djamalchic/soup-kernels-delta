@@ -57,6 +57,7 @@ import weakref
 
 import torch
 
+from . import host_weights
 from .kernels.head_ce import IGNORE_INDEX, SoupHeadCE
 
 _PATCH_MARK = "_soup_delta_head_ce"
@@ -302,6 +303,10 @@ def _embedding_output_to_fp32(module, args, output):
 
 def _fp16_exact_copy(w):
     """An fp16 tensor equal to fp32 `w` element for element, or None. One host sync."""
+    src = host_weights.host_source(w)
+    if src is not None:  # v12 H: the check and the copy stay in host memory
+        h16 = src.half()
+        return None if bool(h16.float().ne(src).any()) else host_weights.to_host(h16)
     w16 = torch.empty(w.shape, dtype=torch.float16, device=w.device)
     bad = torch.zeros((), dtype=torch.bool, device=w.device)
     for r0 in range(0, w.shape[0], _STORE_CHUNK_ROWS):
