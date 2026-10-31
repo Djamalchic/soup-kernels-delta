@@ -32,6 +32,10 @@ Launched entries and their bodies:
   nf4.soup_nf4_dequant_usig       -> soup_nf4_dequant_kernel   (K1)
   swiglu.soup_swiglu_kernel       its own body (v8 C2)
 
+v10 P2 (addnorm.USE_EW_K3): addnorm.soup_addnorm_fwd_v10 / soup_addnorm_bwd_v10 take the two K3
+slots (same twelve-slot layout, every int / float slot runtime, all seven pointers real), so a run
+still builds five cubins and one launcher.
+
 Each *_usig entry calls the v7 kernel as a Triton device function with its own arguments unchanged,
 the v7 constexpr values and the v7 launch options (num_warps, enable_fp_fusion). Triton inlines the
 call, and the pointer and int slots v7 specialised are specialised the same way here, so the

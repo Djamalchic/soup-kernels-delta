@@ -42,18 +42,39 @@ fp16; not tracing/compiling. Anything else runs the forward that was installed b
 peft's). Backward: r's version counter must not have moved (as torch's own saved-tensor check).
 No Triton kernel lives here; nothing touches CUDA at import or patch time.
 
+v10 P2 (USE_LORA_NO_CLONE / USE_LORA_EPILOGUE, set by solution.apply()): on this path the base
+output goes straight into an out-of-place add, so peft's defensive clone (bnb.py:528-533) is an
+identity and is skipped. With the epilogue the base matmul runs on fp16(x) (the cast Linear4bit
+makes itself, nn/modules.py:626-628) and `f32(base16) + f32(fp16(lora_B(h) * s))` plus its backward
+(fp16(g) for the base, fp16(f32(fp16(g)) * s) for lora_B) are one K3-v10 launch each way
+(_LoraEpilogue, kernels/addnorm.py modes 2 / 3) instead of `.to(fp32)`, clone, mul, add and two
+casts + a mul in backward. Taken only for an exact fp16-compute bnb Linear4bit base and an
+fp16-exact scaling (the task's 32 / 16 = 2.0); anything else keeps the ops above. Same bits
+(tests/test_ew_fusion.py: the LoRA pair against v8b, torch.equal).
+
 Idea credit: selective activation recomputation (Korthikanti et al. 2022, arXiv:2205.05198) and
-torch.utils.checkpoint's RNG-state replay; code written from scratch.
+torch.utils.checkpoint's RNG-state replay; code written from scratch. Fusing a LoRA output
+epilogue (scale + residual add) into one pass is a common trick (e.g. Unsloth's LoRA kernels, idea
+only); code written from scratch.
 """
 
 import contextlib
 import contextvars
+import struct
 
 import torch
 
 from .saved_compact import _hooks
 
 USE_LORA_INPUT_RECOMPUTE = False  # read on every call; solution.apply() sets it
+# v10 P2 (read on every call; solution.apply() sets them, module defaults = v9b):
+# USE_LORA_NO_CLONE: no copy of the base output before the out-of-place add (peft's defensive
+#   clone, bnb.py:528-533, is an identity there: same values, same gradients).
+# USE_LORA_EPILOGUE: `.to(fp32)` + clone + `* scaling` + add, and their backward casts and mul, in
+#   one K3-v10 launch each way (_LoraEpilogue). Needs kernels/addnorm.py USE_EW_K3 (apply() ties
+#   them), so the K3 forward entry it launches is the one the run compiles anyway.
+USE_LORA_NO_CLONE = False
+USE_LORA_EPILOGUE = False
 
 _MARK = "_soup_delta_lora_recompute"
 _K3_MARK = "_soup_delta_addnorm"  # = solution/layers.py _MARK
@@ -62,8 +83,10 @@ _HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_back
 _GLOBAL_HOOKS = ("_global_forward_hooks", "_global_forward_pre_hooks",
                  "_global_backward_hooks", "_global_backward_pre_hooks")
 # recompute: LoRA calls on our path; original: calls handed to the previous forward;
-# packed: tensors swapped for a recipe; rebuilt: x_bt rebuilds in backward; stashed: pair hits.
-COUNTS = {"recompute": 0, "original": 0, "packed": 0, "rebuilt": 0, "stashed": 0, "scopes": 0}
+# packed: tensors swapped for a recipe; rebuilt: x_bt rebuilds in backward; stashed: pair hits;
+# epilogue (v10 P2): calls whose output came from _LoraEpilogue.
+COUNTS = {"recompute": 0, "original": 0, "packed": 0, "rebuilt": 0, "stashed": 0, "scopes": 0,
+          "epilogue": 0}
 _REFS = {}  # captured at patch time (Soup's tests may swap sys.modules["torch"] later)
 
 
@@ -277,15 +300,89 @@ def _adapter(layer, x):
     return name
 
 
+def _fp16_exact_scale(scaling):
+    """float(scaling) when it is a finite Python number that fp16 holds exactly, else None. Then
+    fp16(s) == fp32(s) == s, so the scalar operand of `fp16 tensor * scaling` has one value
+    however torch narrows it (P2 epilogue). Soup's task: alpha 32 / r 16 = 2.0."""
+    if isinstance(scaling, bool) or not isinstance(scaling, (int, float)):
+        return None
+    try:
+        s = float(scaling)
+        if s != s or abs(s) == float("inf"):
+            return None
+        if struct.unpack("<e", struct.pack("<e", s))[0] != s:
+            return None
+    except (OverflowError, struct.error, ValueError):
+        return None
+    return s
+
+
+def _epilogue_base(layer):
+    """v10 P2: True when `layer.base_layer(x.to(fp16))` returns exactly the fp16 matmul output that
+    `layer.base_layer(x)` casts to fp32 for an fp32 x: an exact, hook-free bitsandbytes
+    Linear4bit whose compute dtype is fp16 and already fixed (bitsandbytes nn/modules.py:570,
+    622-628, 630-635: with compute_type_is_set it never re-derives the compute dtype from the
+    input; the input cast `x.to(self.compute_dtype)` is a no-op on fp16, the bias is cast to x's
+    (= the compute) dtype either way, and the final `.to(inp_dtype)` (:637) is a no-op on the
+    fp16 result). Reads only."""
+    base = getattr(layer, "base_layer", None)
+    cls = _REFS.get("bnb_linear4bit")
+    return (cls is not None and type(base) is cls and _hookless(base)
+            and getattr(base, "compute_type_is_set", False) is True
+            and getattr(base, "compute_dtype", None) is torch.float16)
+
+
+class _LoraEpilogue(torch.autograd.Function):
+    """v10 P2: peft's `result + lora_B(h) * scaling` (bnb.py:549-552) with result = f32(base16) and
+    the defensive clone (:533), in one K3-v10 launch each way (kernels/addnorm.py modes 2 / 3).
+
+    Forward: f32(base16) + f32(fp16(f32(lb16) * s)), the values of bnb's `.to(fp32)` (exact),
+    the clone (identity), torch's fp16 * scalar (product in fp32, one rounding to fp16) and the
+    type-promoting fp32 add. Backward from the fp32 g: base16 gets fp16(g) (ToCopyBackward of
+    `.to(fp32)` through CloneBackward / AddBackward), lb16 gets fp16(f32(fp16(g)) * s) (the add's
+    cast of g to its fp16 input, then MulBackward)."""
+
+    @staticmethod
+    def forward(ctx, base16, lb16, scale):
+        from .kernels import addnorm as k3
+
+        ctx.set_materialize_grads(False)
+        ctx.scale = scale
+        return k3.lora_epilogue_fwd(base16, lb16, scale)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, g):
+        from .kernels import addnorm as k3
+
+        need_b, need_l = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+        if g is None or not (need_b or need_l):
+            return None, None, None
+        if g.dtype != torch.float32:
+            g = g.float()  # never in training: the output is fp32
+        g16, gl16 = k3.lora_epilogue_bwd(g, ctx.scale)
+        return (g16 if need_b else None), (gl16 if need_l else None), None
+
+
 def _forward_recompute(layer, x, name, src):
     """peft tuners/lora/bnb.py:513-565 for one vanilla adapter under fp16 autocast."""
     layer._check_forward_args(x)  # :514 (returns at once: no adapter_names)
-    result = layer.base_layer(x)  # :527
-    result = result.clone()  # :533
+    scaling = layer.scaling[name]
+    # v10 P2 epilogue: the base matmul is called on fp16(x), which is the cast Linear4bit makes
+    # itself (bnb nn/modules.py:626-628: the same `x.to(fp16)` op, the same autograd node), and
+    # its fp16 output goes to the fused epilogue instead of `.to(fp32)` + clone + mul + add.
+    scale = _fp16_exact_scale(scaling) if USE_LORA_EPILOGUE else None
+    if scale is not None and _epilogue_base(layer):
+        base16 = layer.base_layer(x.to(torch.float16))  # :527, fp16 out
+        result = None
+    else:
+        base16 = None
+        result = layer.base_layer(x)  # :527
+        if not USE_LORA_NO_CLONE:
+            result = result.clone()  # :533 (P2 skips it: an identity before an out-of-place add)
     lora_A = layer.lora_A[name]
     lora_B = layer.lora_B[name]
     p = float(layer.lora_dropout[name].p)
-    scaling = layer.scaling[name]
     # :543 requires_conversion is False (autocast on): x goes to dropout as it is.
     state = torch.cuda.get_rng_state(x.device)  # before the draw: the offset this call uses
     a2 = _REFS["a2"]
@@ -301,6 +398,16 @@ def _forward_recompute(layer, x, name, src):
     with _hooks(pack, unpack):
         h = lora_A(d16)  # module call: fp16 input untouched by autocast, fp16 weight cast cached
     del d16
+    if base16 is not None:
+        lb16 = lora_B(h)  # :549 without `* scaling` (the epilogue applies it)
+        from .kernels import addnorm as k3
+
+        if k3.lora_epilogue_ok(base16, lb16):
+            COUNTS["epilogue"] += 1
+            return _LoraEpilogue.apply(base16, lb16, scale)
+        result = base16.to(x.dtype)  # bnb's `.to(inp_dtype)` (:637); peft's ops from here on
+        output = lb16 * scaling  # :549
+        return result + output  # :552
     output = lora_B(h) * scaling  # :549
     return result + output  # :552, :565
 
@@ -322,7 +429,11 @@ def patch_lora_input_recompute():
         from . import lora_replay as a2
     except Exception:  # noqa: BLE001
         a2 = None
-    _REFS.update(dropout=F.dropout, cls=cls, a2=a2)
+    try:  # v10 P2 epilogue: the exact base-layer class it accepts (peft imported it already)
+        from bitsandbytes.nn import Linear4bit as bnb_linear4bit
+    except Exception:  # noqa: BLE001 - without it the epilogue stays off
+        bnb_linear4bit = None
+    _REFS.update(dropout=F.dropout, cls=cls, a2=a2, bnb_linear4bit=bnb_linear4bit)
     original = current
 
     def forward(self, x, *args, **kwargs):

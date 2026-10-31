@@ -45,6 +45,12 @@ contiguous CUDA fp32 [N, 1536] and a a contiguous fp16 tensor of the same shape 
 Anything else takes v5's ops unchanged. No Triton kernel lives in this file and nothing touches
 CUDA at import time.
 
+v10 P2 (kernels/addnorm.py USE_EW_K3): the four fp32 <-> fp16 casts around K3 (x16 = fp16(y) in
+forward and in the backward recompute, dy = f32(dx16), da = fp16(d_mid)) move into the K3 launches
+next to them (launch_fwd16 / launch_bwd16): the same IEEE roundings on the same values, four torch
+launches and ~58 MB of traffic per layer and step fewer at N = 1350 [estimate], and no fp32 y / dy
+buffers.
+
 Idea credit: activation recomputation (Chen et al. 2016, arXiv:1604.06174); saving the residual
 inputs of an add+norm instead of its output follows the "recompute the cheap, keep the small"
 pattern of fused-norm kernels in Liger-Kernel and Unsloth. Code written from scratch.
@@ -68,9 +74,12 @@ class SoupAddNormMLP(torch.autograd.Function):
 
         ctx.set_materialize_grads(False)
         # Grad mode is off in here: nothing below is recorded.
-        r_mid, y, rstd = k3._launch_fwd(r, a16, norm_weight, eps)  # v5: add_rmsnorm
-        x16 = y.to(torch.float16)  # v5: S4 forward's x.to(torch.float16)
-        del y
+        if k3.USE_EW_K3:  # v10 P2: K3 stores fp16(y) itself (same bits, one launch less)
+            r_mid, x16, rstd = k3.launch_fwd16(r, a16, norm_weight, eps)
+        else:
+            r_mid, y, rstd = k3._launch_fwd(r, a16, norm_weight, eps)  # v5: add_rmsnorm
+            x16 = y.to(torch.float16)  # v5: S4 forward's x.to(torch.float16)
+            del y
         out16 = _s4.mlp_forward_nograd(x16, gate_proj, up_proj, down_proj)  # v5: S4 forward
         del x16
         # v5: S4 returns out.to(fp32) and the layer adds r_mid + that. The mixed-dtype in-place add
@@ -94,26 +103,47 @@ class SoupAddNormMLP(torch.autograd.Function):
         gate_proj, up_proj, down_proj = ctx.layers
         d_next = k3._grad(d_next)
 
+        ew = k3.USE_EW_K3  # v10 P2
         # d out16 = fp16(d r_next) (v5: ToCopyBackward of out.to(fp32)).
         d_out16 = d_next.to(torch.float16)
         # 1-2. x16 = fp16(K3(r + f32(a))): the forward's kernel on the forward's operands.
-        _, y, _ = k3._launch_fwd(r, a16, norm_weight, ctx.eps, store_r=False)
-        x16 = y.to(torch.float16)
-        del y
+        if ew:  # v10 P2: the forward's launch (mode 1), fp16 straight from K3
+            _, x16, _ = k3.launch_fwd16(r, a16, norm_weight, ctx.eps, store_r=False)
+        else:
+            _, y, _ = k3._launch_fwd(r, a16, norm_weight, ctx.eps, store_r=False)
+            x16 = y.to(torch.float16)
+            del y
         # 3. S4 backward (v5: SoupMLPRecompute.backward with the same helpers).
         dh_box = [_s4._down_input_grad(d_out16, down_proj)]
         del d_out16
         dx16 = _s4._gate_up_input_grad(dh_box, x16, gate_proj, up_proj)
         del x16
-        # 4. dy = f32(dx16) (v5: ToCopyBackward of x.to(fp16)); K3 bwd rebuilds r_mid = r + f32(a).
-        dy = dx16.float()
-        del dx16
-        d_mid = k3._launch_bwd(dy, d_next, r, norm_weight, rstd, delta=a16)
-        del dy
-        # 5. The same fp32 grad to both addends; fp16 rounding for a.
+        need_da = ctx.needs_input_grad[1]
+        if ew and _dy16_ok(dx16, r):
+            # v10 P2: K3 bwd widens dx16 itself (the values of dx16.float()) and, for a, writes
+            # fp16(d_mid) back over dx16 (the bits of d_mid.to(fp16)); dx16 is this frame's own
+            # temporary (a fresh GEMM output of _gate_up_input_grad), read by nothing else.
+            d_mid = k3.launch_bwd16(dx16, d_next, r, norm_weight, rstd, delta=a16,
+                                    store_da=need_da)
+            da = dx16 if need_da else None
+            del dx16
+        else:
+            # 4. dy = f32(dx16) (v5: ToCopyBackward of x.to(fp16)); K3 bwd rebuilds r + f32(a).
+            dy = dx16.float()
+            del dx16
+            d_mid = k3._launch_bwd(dy, d_next, r, norm_weight, rstd, delta=a16)
+            del dy
+            # 5. The same fp32 grad to both addends; fp16 rounding for a.
+            da = d_mid.to(a16.dtype) if need_da else None
         dr = d_mid if ctx.needs_input_grad[0] else None
-        da = d_mid.to(a16.dtype) if ctx.needs_input_grad[1] else None
         return dr, da, None, None, None, None, None
+
+
+def _dy16_ok(dx16, r):
+    """v10 P2: dx16 may go to K3 bwd as its fp16 dy (and take fp16(d_mid) back in place)."""
+    return (isinstance(dx16, torch.Tensor) and dx16.dtype == torch.float16
+            and dx16.shape == r.shape and dx16.device == r.device
+            and dx16.is_contiguous() and dx16.data_ptr() % 16 == 0)
 
 
 def _hookless(module):

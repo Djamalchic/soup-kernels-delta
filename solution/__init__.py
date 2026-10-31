@@ -76,6 +76,11 @@ and `solution/kernels/head_ce.py` VOCAB_TILE goes 16384 -> K2_VOCAB_TILE so K2's
 the new peak. Forward values unchanged; the S4 input gradient is bit-identical to "both" when
 cuBLAS's u GEMM gives the same rows for M = chunk as for M = N (tests/test_bwd_chunking.py checks
 it on the T4); K2's hidden gradient sums 19 tile partials instead of 10 (equal within K2's tests).
+v10 P2 (USE_ELEMENTWISE_FUSION, flags below): element-wise casts / copies / adds of our own paths
+run inside launches we already make: B's four fp32 <-> fp16 casts inside K3 (`solution/kernels/
+addnorm.py` *_v10 entries, `solution/fused_block.py`), and M2's q/v LoRA output (bnb's `.to(fp32)`,
+peft's clone, `* scaling`, the add, and their backward) as one K3-v10 launch each way
+(`solution/lora_recompute.py`). Same IEEE operations on the same values; still five cubins.
 """
 
 from . import fused_block, head_loss, lora_recompute, lora_replay, mlp, mlp_recompute, saved_compact
@@ -150,6 +155,27 @@ K2_VOCAB_TILE = 8192
 # [estimate]. Same values. False = v8b.
 USE_LORA_INPUT_RECOMPUTE = True
 
+# v10 P2, element-wise casts / copies / adds fused into launches we already make. Master switch
+# (False = v9b exactly) and three sub-flags. No new compiled kernel: with EW_K3_FP16 every K3
+# launch goes to the two *_v10 entries of solution/kernels/addnorm.py instead of the v8 pair.
+# Per step at P = 2048, N = 1350 [estimate]:
+# - EW_K3_FP16 (fused_block.py B): K3 writes B's x16 itself (forward and backward recompute), reads
+#   dx16 as its fp16 dy and writes da16 back in place: -4 torch launches per layer (-112 / step),
+#   ~-58 MB traffic per layer (~-6 ms GPU / step), no fp32 y / dy buffers.
+# - EW_LORA_EPILOGUE (lora_recompute.py M2, needs EW_K3_FP16): q / v LoRA output = f32(base16) +
+#   f32(fp16(lora * s)) in one K3-v10 launch; backward casts + mul in one more: -7 torch, +2 Triton
+#   launches per LoRA call (-392 torch / +112 Triton per step), ~-10 ms GPU / step. Only when the
+#   LoRA scaling is fp16-exact (task: 2.0).
+# - EW_LORA_NO_CLONE (M2): peft's defensive clone of the base output is skipped (identity before
+#   an out-of-place add): -56 launches / ~-5 ms GPU per step; covered by the epilogue when it runs.
+# Same bits by construction (the same IEEE ops); tests/test_ew_fusion.py checks them on the T4,
+# including whether the v10 K3 entries keep v9b's rstd summation order (else: fp32 ulps vs v9b,
+# consistent inside the run).
+USE_ELEMENTWISE_FUSION = True
+EW_K3_FP16 = True
+EW_LORA_EPILOGUE = True
+EW_LORA_NO_CLONE = True
+
 
 def apply():
     # nf4 and head_ce are imported above (K1 patch, head_loss); addnorm loads here. Importing a
@@ -162,6 +188,12 @@ def apply():
     _nf4.DENSE_CACHE_MIB = DENSE_CACHE_MIB
     for _kernels in (_nf4, _k3, _k2):  # C1, read at every launch
         _kernels.USE_UNIFIED_SIG = bool(USE_UNIFIED_SIG)
+    # v10 P2, read at every call. The epilogue launches the K3-v10 forward entry, so it is only on
+    # together with EW_K3_FP16 (otherwise a run would compile both K3 forward entries).
+    _ew = bool(USE_ELEMENTWISE_FUSION)
+    _k3.USE_EW_K3 = _ew and bool(EW_K3_FP16)
+    lora_recompute.USE_LORA_EPILOGUE = _k3.USE_EW_K3 and bool(EW_LORA_EPILOGUE)
+    lora_recompute.USE_LORA_NO_CLONE = _ew and bool(EW_LORA_NO_CLONE)
     mlp.USE_SOUP_SWIGLU = bool(USE_SOUP_SWIGLU)  # C2, read by K4 and S4 at every call
     patch_bnb_matmul_4bit()        # K1
     patch_qwen2_mlp_fp16()         # K4

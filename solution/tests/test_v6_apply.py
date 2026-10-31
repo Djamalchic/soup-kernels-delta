@@ -51,7 +51,9 @@ def recorder(monkeypatch):
                       (saved_compact, "USE_SDPA_KV_COMPACT"), (sdpa_recompute, "USE_SDPA_RECOMPUTE"),
                       (sdpa_recompute, "USE_CAUSAL_PADDED"), (sdpa_recompute, "USE_ROW_COMPACT"),
                       (lora_replay, "USE_LORA_DROPOUT_REPLAY"), (head_loss, "STORE_HEAD_FP16"),
-                      (lora_recompute, "USE_LORA_INPUT_RECOMPUTE")):
+                      (lora_recompute, "USE_LORA_INPUT_RECOMPUTE"),
+                      (lora_recompute, "USE_LORA_EPILOGUE"),  # v10 P2
+                      (lora_recompute, "USE_LORA_NO_CLONE")):  # v10 P2
         monkeypatch.setattr(mod, flag, getattr(mod, flag))
     from solution import mlp
     from solution.kernels import addnorm, head_ce, nf4  # v7 I3 / v8 C1: apply() writes these too
@@ -60,6 +62,7 @@ def recorder(monkeypatch):
         monkeypatch.setattr(nf4, flag, getattr(nf4, flag))
     for mod in (nf4, addnorm, head_ce):  # v8 C1
         monkeypatch.setattr(mod, "USE_UNIFIED_SIG", getattr(mod, "USE_UNIFIED_SIG"))
+    monkeypatch.setattr(addnorm, "USE_EW_K3", addnorm.USE_EW_K3)  # v10 P2
     monkeypatch.setattr(mlp, "USE_SOUP_SWIGLU", mlp.USE_SOUP_SWIGLU)  # v8 C2
     for flag in ("BWD_ROW_CHUNKS", "BWD_CHUNK_MIN_ROWS"):  # v9 M5
         monkeypatch.setattr(mlp_recompute, flag, getattr(mlp_recompute, flag))
@@ -71,7 +74,9 @@ def recorder(monkeypatch):
                  "DENSE_CACHE_MIB", "USE_UNIFIED_SIG", "USE_SOUP_SWIGLU",
                  "USE_LORA_INPUT_RECOMPUTE",  # v9 M2
                  "USE_SDPA_ROW_COMPACT",  # v9 M3
-                 "USE_BWD_CHUNKING", "BWD_ROW_CHUNKS", "BWD_CHUNK_MIN_ROWS", "K2_VOCAB_TILE"):  # M5
+                 "USE_BWD_CHUNKING", "BWD_ROW_CHUNKS", "BWD_CHUNK_MIN_ROWS", "K2_VOCAB_TILE",  # M5
+                 "USE_ELEMENTWISE_FUSION", "EW_K3_FP16", "EW_LORA_EPILOGUE",  # v10 P2
+                 "EW_LORA_NO_CLONE"):
         monkeypatch.setattr(solution, flag, getattr(solution, flag))
     return calls, result
 
