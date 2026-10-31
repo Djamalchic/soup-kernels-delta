@@ -1,11 +1,11 @@
 # Team Delta: Soup Kernel Challenge (Decentrathon 6.0)
 
 > - **Task.** Make `soup train` (Qwen2.5-1.5B, NF4, LoRA, fp16) faster and smaller on a Kaggle T4 with our own Triton kernels, at the same loss.
-> - **Result.** 64.1 s against 82.9 s (s = 1.293), peak 2,335 against 14,345 MiB (m = 6.144), eval loss 2.04965 against 2.04964, 10 of 10 checks passed.
+> - **Result.** Public notebook, saved version 26: 65.1 s against 87.6 s (s = 1.346), peak 2,335 against 14,345 MiB (m = 6.144), eval loss 2.04965 against 2.04965, 10 of 10 checks passed. The same code one session earlier (version 24): 64.1 against 82.9 s (s = 1.293), same peak.
 > - **Kernels.** Five of ours: NF4 dequant, LM head + cross entropy, add + RMSNorm forward and backward, SwiGLU; one launcher.
 > - **What is new.** No [B, T, V] logits, no padding in token-wise ops, backward tensors recomputed or kept on real rows, compile overlapped with model loading, q, k, v as one GEMM.
 > - **Verify.** Copy the notebook https://www.kaggle.com/code/jamildeltacaptain/notebook0289d149f3 (its saved version already has `COMMIT` set to the final commit, tag `submission`) and click Run All.
-> - **Code.** https://github.com/BAITC-Hacks/hack-8cddb4ae-delta, code v11 = `f218f86`; the final commit (tag `submission`, https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/tree/submission) changes only documentation.
+> - **Code.** https://github.com/BAITC-Hacks/hack-8cddb4ae-delta, code v11 = `f218f86`; the final commit (tag `submission` = `6376c0a`, https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/tree/submission, the commit the notebook ran) changes only documentation, and the one docs commit after it only writes the saved version's numbers into this README and SUBMISSION.md.
 
 ## 1. What we did and why
 
@@ -83,36 +83,36 @@ ChatGPT (GPT-6-Astra) and Claude were used as coding assistants, as the rules al
    python harness/score.py runs/result.json
    ```
 
-6. Expected output, with our version 24 numbers; seconds vary by session:
+6. Expected output, with the numbers of the saved notebook version 26; seconds vary by session:
    - `pytest` reports `623 passed`.
    - `run_task.py` ends with:
      ```
      === result ===
-     base      time     82.9 s   peak  14345 MiB   eval loss 2.04964
-     solution  time     64.1 s   peak   2335 MiB   eval loss 2.04965
-     speedup 1.293x   memory base/solution 6.144x   eval loss vs base 0.0 %
+     base      time     87.6 s   peak  14345 MiB   eval loss 2.04965
+     solution  time     65.1 s   peak   2335 MiB   eval loss 2.04965
+     speedup 1.346x   memory base/solution 6.144x   eval loss vs base 0.0 %
      ```
    - `check_rules.py` prints ten `PASS` lines, then `ALL CHECKS PASSED`.
    - `score.py` ends with `all checks passed on this result: True`.
-7. Run All took about 12 minutes for v10b, plus queueing.
+7. Run All takes about 15 minutes (5 of them `pytest`), plus queueing: version 26 waited about four hours for a T4 on a Saturday evening.
 8. Variants: in `solution/__init__.py`, `USE_MERGED_QKV = False` gives v10d, plus `USE_PRECOMPILE_OVERLAP = False` v10c, plus `STORE_HEAD_FP16 = False` v10b, plus `USE_ELEMENTWISE_FUSION = False` v9b. Push a branch and put its commit in `COMMIT`.
 
 ## 3. Results and limitations
 
 ### Final run against the base
 
-Kaggle T4, notebook version 24, `--repeats 2`, code `f218f86`.
+Kaggle T4, the public notebook's saved version 26 (`COMMIT` = `6376c0a`, code `f218f86`), `--repeats 2`. Version 24 ran the same code one session earlier: 64.1 (64.27, 63.97) against 82.9 (82.02, 83.83) s, s = 1.293, the same peak and checks.
 
 | | Base Soup 0.77.0 | Ours (v11) | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s (repeats) | 82.9 (82.02, 83.83) | 64.1 (64.27, 63.97) | s = 1.293, wall 22.7% shorter |
+| Time of `soup train`, s (repeats) | 87.6 (90.57, 84.65) | 65.1 (64.46, 65.76) | s = 1.346, wall 25.7% shorter |
 | Peak GPU memory, MiB | 14,345 | 2,335 | m = 6.144, 83.7% less |
-| Eval loss, public rows | 2.04964 | 2.04965 | +0.000% |
-| Own kernels' share, check 4 | | 11.5% | threshold 5% |
-| `check_rules.py` | | 10 of 10 passed | check 8: time x0.773, memory x0.163 |
+| Eval loss, public rows | 2.04965 | 2.04965 | +0.000% |
+| Own kernels' share, check 4 | | 11.4% | threshold 5% |
+| `check_rules.py` | | 10 of 10 passed | check 8: time x0.743, memory x0.163 |
 | `pytest solution -q` | | 623 passed, 0 failed | 600 for v10d |
 
-s = 1.293 is below v10d's 1.310 only because this session's base was faster (82.9 against 84.9 s); the same-session comparison below is the reliable one.
+s moves with the session's base: 1.346 in version 26 (base 87.6 s), 1.293 in version 24 (base 82.9 s), 1.310 for v10d (base 84.9 s). The same-session comparison below is the reliable one.
 
 Q adds no Triton kernel. In the v11 run check 3 listed `soup_addnorm_bwd_v10`, `soup_addnorm_fwd_v10`, `soup_head_ce_usig`, `soup_nf4_dequant_usig` and `soup_swiglu_kernel`; check 6 held the loss curve within 0.00 to 0.01 % of the base; check 9 was clean; check 10 passed Soup's 79 tests.
 
@@ -137,7 +137,7 @@ Each row is against the base of its own session (77 to 90 s); rows from v4 on ar
 | v10b | + P2 | 89.8 | 71.6 | 2,495 | 1.254 | 5.750 |
 | v10c | + fp16 head | 87.6 (89.11, 86.11) | 66.3 (65.56, 67.02) | 2,335 | 1.322 | 6.144 |
 | v10d | + overlap (previous) | 84.9 | 64.8 | 2,335 | 1.310 | 6.144 |
-| **v11** | **+ Q (submitted)** | **82.9** | **64.1** | **2,335** | **1.293** | **6.144** |
+| **v11, two sessions** | **+ Q (submitted)** | **87.6; 82.9** | **65.1; 64.1** | **2,335** | **1.346; 1.293** | **6.144** |
 
 ### Same-session comparisons
 

@@ -55,21 +55,21 @@ Ideas from other work, with links; we wrote the code ourselves and import no ban
 ChatGPT (GPT-6-Astra) and Claude were used as coding assistants, as the rules allow.
 
 ## Results on Kaggle T4
-From `runs/result.json` and `runs/checks.json` of the notebook above: notebook version 24, `--repeats 2` in the order base, ours, ours, base, code `f218f86`.
+From `runs/result.json` and `runs/checks.json` of the notebook above, saved version 26 (`COMMIT` = `6376c0a`, code `f218f86`), `--repeats 2` in the order base, ours, ours, base. Version 24 ran the same code one session earlier: 64.1 (64.27 and 63.97) against 82.9 (82.02 and 83.83) s, speedup 1.293, the same peak and checks.
 
 | | Base Soup | Ours (v11) | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 82.9 (82.02 and 83.83) | 64.1 (64.27 and 63.97) | speedup 1.293, wall 22.7% shorter |
+| Time of `soup train`, s | 87.6 (90.57 and 84.65) | 65.1 (64.46 and 65.76) | speedup 1.346, wall 25.7% shorter |
 | Peak GPU memory, MiB | 14,345 | 2,335 | base/ours 6.144, 83.7% less |
-| Eval loss, public rows | 2.04964 | 2.04965 | +0.000% vs base |
+| Eval loss, public rows | 2.04965 | 2.04965 | +0.000% vs base |
 
-- [x] All 10 checks of `harness/check_rules.py` passed: check 4 11.5%; check 8 time x0.773, memory x0.163. Q adds no Triton kernel. In the v11 run (version 24) check 3 listed `soup_addnorm_bwd_v10`, `soup_addnorm_fwd_v10`, `soup_head_ce_usig`, `soup_nf4_dequant_usig` and `soup_swiglu_kernel`; check 6 read 0.00 to 0.01%; check 9 was clean; check 10 had 79 passed. v10c passed all 10 too.
+- [x] All 10 checks of `harness/check_rules.py` passed: check 4 11.4% (11.5% in version 24); check 8 time x0.743, memory x0.163. Q adds no Triton kernel. In the v11 runs (versions 24 and 26) check 3 listed `soup_addnorm_bwd_v10`, `soup_addnorm_fwd_v10`, `soup_head_ce_usig`, `soup_nf4_dequant_usig` and `soup_swiglu_kernel`; check 6 read 0.00 to 0.01%; check 9 was clean; check 10 had 79 passed. v10c passed all 10 too.
 - [x] `pytest solution -q`: 623 passed, 0 failed; v10d 600 (also in notebook version 21), v10c and v10b 578, v9b 485, each with 0 failed. In v10d's run the `triton_cache` held one `__triton_launcher*.so` and 5 cubins, as in v10b. We did not read the head's store counts, so we do not claim them.
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits.
 
 Previous version, v10d: notebook version 22, `--repeats 2`, code `6b56d31`. Ours 65.43 and 64.13 s (64.8) against base 86.24 and 83.54 s (84.9), speedup 1.310, wall 23.7% shorter; peak 2,335 against 14,345 MiB, base/ours 6.144; eval loss 2.04963 against 2.04964, −0.000% vs base.
 
-v11's speedup, 1.293, is below v10d's 1.310 only because this session's base was faster, 82.9 against 84.9 s. The same-session comparison is the reliable one: notebook version 23, ABBA, v10d 65.84 and 65.69 s, v11 65.24 and 65.19 s, 0.55 s less; peak 2,335 MiB in both.
+v11's speedup moves with the session's base: 1.346 in version 26 (base 87.6 s), 1.293 in version 24 (base 82.9 s), against v10d's 1.310 (base 84.9 s). The same-session comparison is the reliable one: notebook version 23, ABBA, v10d 65.84 and 65.69 s, v11 65.24 and 65.19 s, 0.55 s less; peak 2,335 MiB in both.
 
 README.md, part 3, has the path from the example only (s = 0.937, m = 1.158) to v11, one row per version, and the same-session runs for the fp16 head, P2, the compile overlap and Q.
 
@@ -82,7 +82,7 @@ Which operations we sped up and why, how K1, K2, K3 and C2 work, the PyTorch-lev
 - **Compile overlap.** One ABBA session, notebook version 21, two runs per version: 2.1 s less on the means (v10c 66.23 and 67.08 s, v10d 63.97 and 65.11 s) against repeat spreads of 0.85 and 1.14 s; the peak stayed at 2,335 MiB. `USE_PRECOMPILE_OVERLAP = False` with Q off gives v10c.
 - **M5 off.** Chunked S4 backward and a smaller K2 tile (`USE_BWD_CHUNKING`) gave 40 MiB less peak for an estimated 0.5 s and are not bit-exact.
 - **C2 is the example's math.** If the jury does not count `soup_swiglu_kernel`, our share was 9.8% without it at v7, still above 5%.
-- **Noise.** Base time ran 77 to 90 s across full runs, so compare within a session, not seconds across sessions; even s moves with the base (v11 reads 1.293 against v10d's 1.310 because the base ran 82.9 against 84.9 s). The two full v9b runs gave s = 1.278 and 1.244, more than P2's gain or the head's time effect, so we do not credit the head with the rise from v10b's 1.254 to 1.322. Repeats differed by 1.46 s for us and 3.00 s for the base in the v10c run, by 1.30 s and 2.70 s in the v10d run, and by 0.30 s and 1.81 s in the v11 run. Only sums are measured, not per-component splits.
+- **Noise.** Base time ran 77 to 90 s across full runs, so compare within a session, not seconds across sessions; even s moves with the base (v11 reads 1.346 in version 26 and 1.293 in version 24 because the base ran 87.6 and 82.9 s). The two full v9b runs gave s = 1.278 and 1.244, more than P2's gain or the head's time effect, so we do not credit the head with the rise from v10b's 1.254 to 1.322. Repeats differed by 1.46 s for us and 3.00 s for the base in the v10c run, by 1.30 s and 2.70 s in the v10d run, by 0.30 s and 1.81 s in the v11 run of version 24, and by 1.30 s and 5.92 s in version 26. Only sums are measured, not per-component splits.
 - **P2 and v9b's bits.** P2 is bit-exact against the torch ops it replaces and built to give v9b's bits; the suite, including the v9b-bits tests, passed for v10b and v10c.
 - **Memory bought with time.** S4, A1 and M2 recompute in backward; v9 with M2, M3 and M5 ran 2.2 s slower than v8b in one session.
 - **Where the speedup stops.** The GPU idles about 100 to 180 ms per step in Soup and TRL host code. Step 1 compiled our kernels in 3.5 s against 1.8 s for the base at v8b. P1, a pool joined inside `apply()`, moved that cost there and gained nothing; v10d overlaps it with model loading.
