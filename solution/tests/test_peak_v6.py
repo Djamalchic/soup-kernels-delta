@@ -54,6 +54,35 @@ def _assert_matches(ref_a, ref_b, new, name=""):
         assert tu.rel(new, ref_a) <= 4 * noise + 1e-7, name
 
 
+# LoRA gradients of a whole-model training step. The backward of these stacks is not reproducible
+# run to run, so _assert_matches' "ref_a == ref_b, hence bit for bit" is a two-sample guess that
+# fails at random. Kaggle T4 evidence (30.10): two identical v5 runs of test_v6_merged's stack came
+# out rel 2.9e-6 apart on layer 0's q lora_A (v6.1 candidate); the same v6.1 code passed
+# test_real_width_stack_matches_v5_and_holds_less in one run and failed it in the next (layers.1
+# q lora_B with ref_a == ref_b, new != ref_a); v7 failed it again the same way, and
+# test_v6_no_leak's I3 cache test on layer 0's q lora_A (-3.7050e-04 vs -3.7074e-04, forward bit
+# for bit). Suspected source: torch's memory-efficient SDPA backward (non-deterministic by
+# default; from memory, torch source is not on disk); it is in the reference path of all three.
+# The forward stays deterministic and is still checked bit for bit (loss, hidden, RNG).
+# Bound: the derived LoRA-gradient tolerance of the K1/K3/K4 composition (test_unpad.py, comment
+# above check_against_base: each fp16 output may round to a neighbouring value, u = 2**-11, at most
+# 12 such roundings on a path, worst case 12 u = 5.9e-3 -> 1e-2 with margin, doubled for K1/K3/K4
+# -> 2e-2), the same 2e-2 test_v6_merged's merge test uses. A routing or cache bug moves a gradient by O(1)
+# (test_unpad test_grad_check_catches_misrouted_rows: rel ~1) or already breaks the forward.
+GRAD_RTOL = 2e-2
+
+
+def _assert_grad_close(ref_a, ref_b, new, name=""):
+    """A LoRA gradient of `new` against the reference run: bit for bit (True) or within GRAD_RTOL
+    (False). ref_b only labels the reference's own spread in the failure message."""
+    assert new.dtype == ref_a.dtype and new.shape == ref_a.shape, name
+    if _same(new, ref_a):
+        return True
+    err = tu.rel(new, ref_a)
+    assert err <= GRAD_RTOL, (name, err, tu.rel(ref_b, ref_a))
+    return False
+
+
 @pytest.fixture
 def sdpa_patch():
     """A's registry wrapper installed for the test, the registry put back afterwards."""
@@ -182,6 +211,7 @@ def s4(monkeypatch):
     nf4.patch_bnb_matmul_4bit()
     monkeypatch.setattr(rc, "USE_MLP_RECOMPUTE", True)
     monkeypatch.setattr(rc, "RECOMPUTE_GATE", True)
+    monkeypatch.setattr(rc, "S4_DEQUANT_REUSE", "off")  # v6.1 unless a test says otherwise
     monkeypatch.setattr(rc, "SWIGLU_BACKWARD", "example")
     rc.patch_qwen2_mlp_recompute()
     assert rc._swiglu_example_kernel is not None
@@ -277,6 +307,93 @@ def test_fused_block_bit_exact_and_saves_less(s4, monkeypatch, rows, r_grad):
     # v5 keeps r_mid (fp32) + x16 (fp16); B keeps a (fp16) only (r is the caller's tensor).
     expect = rows * H * (4 + 2 - 2)
     assert h0 - h1 >= 0.9 * expect, (h0, h1, expect)
+
+
+# ---------------------------------------------------------------------------------------------
+# v7 I2: dequant reuse in the S4 backward (S4_DEQUANT_REUSE), through B and alone
+# ---------------------------------------------------------------------------------------------
+
+def _k1_dense(mlp, rows):
+    probe = torch.empty(rows, H, device="cuda", dtype=torch.float16)
+    w = mlp.up_proj.weight
+    return nf4.k1_dense_path(probe, w, w.quant_state)
+
+
+@pytest.mark.parametrize("rows", [300, 1350, 2000])
+def test_fused_block_dequant_reuse_bit_exact(s4, monkeypatch, rows):
+    """B with "both" against v5's ops with "off": same output, same dr and da, bit for bit."""
+    monkeypatch.setattr(fb, "USE_FUSED_BLOCK", True)
+    layer = _Layer()
+    dense = _k1_dense(layer.mlp, rows)
+    assert dense or rows <= 1536
+    torch.manual_seed(7)
+    r0 = 2.0 * torch.randn(rows, H, device="cuda")
+    a0 = torch.randn(rows, H, device="cuda", dtype=torch.float16)
+    g = torch.randn(rows, H, device="cuda")
+    out = {}
+    for fused, mode in ((False, "off"), (True, "off"), (True, "both"), (False, "both")):
+        monkeypatch.setattr(rc, "S4_DEQUANT_REUSE", mode)
+        r = r0.clone().requires_grad_(True)
+        a = a0.clone().requires_grad_(True)
+        before = dict(rc.REUSE_COUNTS)
+        with torch.autocast("cuda", dtype=torch.float16):
+            if fused:
+                assert fb.fused_ok(layer, r, a, mq.Qwen2MLP, mq.Qwen2RMSNorm)
+                nxt = fb.add_norm_mlp(r, a, layer)
+            else:
+                nxt = _v5_ops(layer, r, a)
+        nxt.backward(g)
+        delta = {k: rc.REUSE_COUNTS[k] - before[k] for k in before}
+        if mode == "both":
+            assert delta == {"both": int(dense), "up": 0, "fallback": int(not dense)}, delta
+        out[(fused, mode)] = (nxt.detach(), r.grad, a.grad)
+    ref = out[(False, "off")]
+    for key, got in out.items():
+        for new, old in zip(got, ref):
+            assert torch.equal(new, old), key
+
+
+def test_dequant_reuse_peak_and_dequant_count(s4, monkeypatch):
+    """At 2000 rows (K1's dense path for sure, ops.py:954-955), per MLP backward: "both" adds at
+    most one dense weight W to the peak (it is held while u is recomputed) and launches 2 fewer
+    big dequants; "up" adds nothing here (U > W) and launches 1 fewer."""
+    mlp = _mlp()
+    rows = 2000
+    assert _k1_dense(mlp, rows)
+    x = torch.randn(rows, H, device="cuda")
+    grad = torch.randn(rows, H, device="cuda")
+    real = nf4.nf4_dequantize
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(nf4, "nf4_dequantize", counting)
+    results = {}
+    for mode in ("off", "both", "up", "off", "both", "up"):  # first pass: warm-up
+        monkeypatch.setattr(rc, "S4_DEQUANT_REUSE", mode)
+        xi = x.clone().requires_grad_(True)
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = mlp(xi)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        calls.clear()
+        out.backward(grad)
+        torch.cuda.synchronize()
+        results[mode] = (out.detach(), xi.grad, torch.cuda.max_memory_allocated() - base,
+                         len(calls))
+        del out, xi
+    (o0, g0, p0, c0) = results["off"]
+    w_bytes, u_bytes = 8960 * H * 2, rows * 8960 * 2
+    assert u_bytes > w_bytes
+    for mode, extra_w, fewer in (("both", 1, 2), ("up", 0, 1)):
+        o, g_, p, c = results[mode]
+        assert torch.equal(o, o0) and torch.equal(g_, g0), mode
+        assert c == c0 - fewer, (mode, c0, c)  # off: down 1 + gate/up recompute 2 + dx 2 = 5
+        assert p - p0 <= extra_w * w_bytes + MiB, (mode, p0 / MiB, p / MiB)
+    assert c0 == 5
 
 
 def test_fused_ok_guards(s4, monkeypatch):
@@ -458,15 +575,13 @@ def _compare_runs(ref_a, ref_b, new):
     assert torch.equal(rnga, rngn)  # A, B and D draw no random numbers
     for s0, s1 in zip(reca["rng_pre"], recn["rng_pre"], strict=True):
         assert torch.equal(s0, s1)
+    # Forward: deterministic, so bit for bit (ref_a == ref_b there).
     _assert_matches(reca["hidden"], recb["hidden"], recn["hidden"], "hidden")
     _assert_matches(la, lb, ln, "loss")
-    # LoRA grads: with A1 (SDPA recompute) the attention backward runs in a different reduction
-    # order, so grads are not bit-exact with v5 (Kaggle T4 30.10: lora_B of layer 1 differed in the
-    # last bits). Same derived bound as test_v6_merged / test_unpad (loss scaled by 2**16).
+    # Backward: bit for bit or within GRAD_RTOL (the reference backward is not reproducible).
+    assert gn.keys() == ga.keys()
     for name in ga:
-        if _same(ga[name], gb[name]) and _same(gn[name], ga[name]):
-            continue
-        assert tu.rel(gn[name], ga[name]) <= 2e-2, name
+        _assert_grad_close(ga[name], gb[name], gn[name], name)
 
 
 def test_small_model_a_and_d_match_v5(forwards, sdpa_patch, monkeypatch):
@@ -508,8 +623,9 @@ def _install_k1_k3_s4(monkeypatch):
 
 
 def test_real_width_stack_matches_v5_and_holds_less(forwards, sdpa_patch, monkeypatch):
-    """K1 + K3 + K4 + S4 + U as in v5, then with B + A + D: same loss, hidden states and LoRA
-    gradients, and less memory held by autograd after the forward."""
+    """K1 + K3 + K4 + S4 + U as in v5, then with B + A + D: same loss and hidden states bit for
+    bit, LoRA gradients bit for bit or within GRAD_RTOL (the v5 backward itself is not
+    reproducible), and less memory held by autograd after the forward."""
     base, patched = forwards
     _install_k1_k3_s4(monkeypatch)
     calls = []

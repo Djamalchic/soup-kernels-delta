@@ -36,6 +36,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+# v10d: precompile.wait() joins a pending background compile (a module-global None check after it)
+from .. import precompile as _precompile
 
 # Fixed launch configuration for sm_75 (T4), the one that was measured.
 # 4 warps = 128 threads; ROWS=256 groups -> 2 groups per thread, 1024 packed
@@ -69,6 +71,25 @@ _NF4_VALUES = (
 )
 
 _ORIGINAL_BNB_MATMUL_4BIT = None
+
+# v7 I3 switches. solution.apply() copies them from solution/__init__.py; the defaults here are the
+# v6.1 behaviour, so tests that import this module alone see v6.1 unless they set them.
+# USE_K1_FAST_HOST: (1) a validation-cache hit also accepts an alias of the validated packed
+#   tensor (same storage start, byte count, dtype, contiguity and device), which D's saved-tensor
+#   hooks (saved_compact.py:126, :197 `t.detach()`) and S4's `weight.view(-1, 1)`
+#   (mlp_recompute.py:226) produce on every call; a miss no longer evicts a live entry for such a
+#   short-lived alias. (2) _launch skips `torch.cuda.device(...)` when the weight is on the current
+#   device (that context only swaps the current device; it creates no stream).
+# USE_DENSE_CACHE: the fp16 result of the shapes in _DENSE_SHAPES (k_proj / v_proj, [256, 1536],
+#   0.75 MiB each) is kept for the whole run, up to DENSE_CACHE_MIB, and returned again for the same
+#   validated weight. DENSE_CACHE_QO adds q_proj / o_proj ([1536, 1536], +252 MiB on 1.5B).
+USE_K1_FAST_HOST = False
+USE_DENSE_CACHE = False
+DENSE_CACHE_QO = False
+DENSE_CACHE_MIB = 64
+# v8 C1 (solution/kernels/__init__.py): launch soup_nf4_dequant_usig, the same kernel inlined behind
+# the launcher signature all our kernels share. solution.apply() sets it; default = v7 launch.
+USE_UNIFIED_SIG = False
 
 
 @triton.jit(do_not_specialize=["n_groups"])
@@ -155,6 +176,23 @@ def soup_nf4_dequant_kernel(
     hb = h.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
     lb = l.to(tl.int16, bitcast=True).to(tl.int32) & 0xFFFF
     tl.store(Out32 + idx, hb | (lb << 16), mask=ok)
+
+
+# v8 C1 entry: slots 0-6 pointers, 7-10 int32, 11 fp32, no constexpr parameter
+# (solution/kernels/__init__.py). Same pointers (specialised as before), n_groups in
+# do_not_specialize as before, ROWS from the same constant; launched with the same num_warps and
+# enable_fp_fusion=False, which apply to the inlined body.
+_ROWS_C = tl.constexpr(_ROWS)
+
+
+@triton.jit(do_not_specialize=["spare_p6", "n_groups", "spare_i1", "spare_i2", "spare_i3",
+                               "spare_f"])
+def soup_nf4_dequant_usig(
+    Packed, Abs8, Abs2, Code2, Offset, Out32, spare_p6,
+    n_groups, spare_i1, spare_i2, spare_i3,
+    spare_f,
+):
+    soup_nf4_dequant_kernel(Packed, Abs8, Abs2, Code2, Offset, Out32, n_groups, _ROWS_C)
 
 
 def _check_tensor(tensor, name, dtype, device, count, *, vector=False):
@@ -249,7 +287,8 @@ def _validate_inputs(packed, quant_state):
 
 
 # Validation cache: id(quant_state) -> what was validated. A hit requires the
-# same live quant_state and packed objects, the same packed storage pointer,
+# same live quant_state and packed objects (with USE_K1_FAST_HOST: or an alias of
+# the same bytes, _is_alias), the same packed storage pointer,
 # the same metadata tensor objects and the same scalar fields; anything else
 # re-runs the full validation. Entries drop out when their quant_state dies
 # (weakref callback). packed is held weakly; the small metadata tensors are held
@@ -271,44 +310,82 @@ def _signature(quant_state, state2):
     )
 
 
+def _is_alias(packed, ptr, numel, dev):
+    """True if `packed` covers exactly the validated bytes: same start address, byte count, dtype,
+    contiguity and device. Together with the same quant_state and the same metadata objects that
+    is everything _validate_inputs checks, so its answer cannot differ (I3)."""
+    return (
+        isinstance(packed, torch.Tensor)
+        and packed.data_ptr() == ptr
+        and packed.numel() == numel
+        and packed.dtype is torch.uint8
+        and packed.is_contiguous()
+        and packed.get_device() == dev
+    )
+
+
 def _checked_shape(packed, quant_state):
     """(n, k) of a valid NF4 weight; raises TypeError/ValueError otherwise."""
-    entry = _VALID.get(id(quant_state))
+    return _checked_entry(packed, quant_state)[0]
+
+
+def _checked_entry(packed, quant_state):
+    """((n, k), entry). `entry` is the _VALID record this (packed, quant_state) pair matched or
+    was just stored under; None when nothing describes this exact pair (then no cache keyed on
+    the record may be trusted, see nf4_dequantize)."""
+    key = id(quant_state)
+    entry = _VALID.get(key)
     if entry is not None:
-        qs_ref, packed_ref, ptr, absmax, state2, abs2, code2, offset, sig, nk = entry
+        (qs_ref, packed_ref, ptr, numel, dev, absmax, state2, abs2, code2, offset, sig,
+         nk) = entry
         s2 = getattr(quant_state, "state2", None)
         if (
             qs_ref() is quant_state
-            and packed_ref() is packed
             and s2 is state2
             and getattr(quant_state, "absmax", None) is absmax
             and getattr(quant_state, "offset", None) is offset
             and getattr(s2, "absmax", None) is abs2
             and getattr(s2, "code", None) is code2
-            and packed.data_ptr() == ptr
             and _signature(quant_state, s2) == sig
         ):
-            return nk
+            if packed_ref() is packed:
+                if packed.data_ptr() == ptr:  # v6.1 hit
+                    return nk, entry
+            elif USE_K1_FAST_HOST and _is_alias(packed, ptr, numel, dev):
+                # D's detach() alias (saved_compact.py:126, :197) or S4's view(-1, 1)
+                # (mlp_recompute.py:226) of the validated weight: same bytes, same answer.
+                # Exception: a Parameter (the Params4bit) whose record is owned by a dead alias
+                # takes the record over once below, so the dense cache (live owner) can hit.
+                if packed_ref() is not None or not isinstance(packed, torch.nn.Parameter):
+                    return nk, entry
 
     n, k = _validate_inputs(packed, quant_state)
 
-    key = id(quant_state)
+    if USE_K1_FAST_HOST and entry is not None:
+        held = entry[1]()
+        if held is not None and held is not packed and entry[0]() is quant_state:
+            # Another live tensor owns the record (normally the Params4bit itself). Keep it: in
+            # v6.1 a short-lived alias evicted it here and the next forward call missed too.
+            return (n, k), None
+
     try:
         qs_ref = weakref.ref(
             quant_state, lambda _ref, key=key, cache=_VALID: cache.pop(key, None)
         )
         packed_ref = weakref.ref(packed)
     except TypeError:
-        return n, k  # not weak-referenceable: validate every call
+        return (n, k), None  # not weak-referenceable: validate every call
     if len(_VALID) >= _VALID_LIMIT:
         _VALID.clear()
     state2 = quant_state.state2
     sig = _signature(quant_state, state2)
     sig = sig[:4] + (tuple(sig[4]),) + sig[5:]  # snapshot of a mutable shape
-    _VALID[key] = (
+    entry = (
         qs_ref,
         packed_ref,
         packed.data_ptr(),
+        packed.numel(),
+        packed.get_device(),
         quant_state.absmax,
         state2,
         state2.absmax,
@@ -317,7 +394,51 @@ def _checked_shape(packed, quant_state):
         sig,
         (n, k),
     )
-    return n, k
+    _VALID[key] = entry
+    return (n, k), entry
+
+
+# I3 dense cache: id(quant_state) -> (quant_state weakref, the _VALID record the tensor was made
+# under, fp16 [N, K] tensor). A lookup hits only while _checked_entry returns that very record for
+# the call's (packed, quant_state), i.e. the same quant_state, metadata objects, signature and
+# packed bytes (identity or _is_alias). Entries die with their quant_state (weakref callback).
+# Not detected, as for _VALID: in-place writes into the packed bytes or the metadata tensors (the
+# NF4 base weight is frozen during training; nothing in Soup / peft / bnb writes it after load).
+_DENSE = {}
+_DENSE_BYTES = [0]
+_DENSE_SHAPES = frozenset({(256, 1536)})  # Qwen2.5-1.5B k_proj / v_proj
+_DENSE_SHAPES_QO = frozenset({(1536, 1536)})  # q_proj / o_proj (DENSE_CACHE_QO)
+
+
+def _dense_drop(key, ref=None, cache=_DENSE, counter=_DENSE_BYTES):
+    # Bound defaults: usable from a weakref callback even late in interpreter shutdown. With
+    # `ref`, only the entry that ref belongs to is dropped (never a newer one under the same key).
+    item = cache.get(key)
+    if item is not None and (ref is None or item[0] is ref):
+        del cache[key]
+        counter[0] -= item[2].numel() * item[2].element_size()
+
+
+def _dense_wanted(nk):
+    return nk in _DENSE_SHAPES or (DENSE_CACHE_QO and nk in _DENSE_SHAPES_QO)
+
+
+def _dense_store(key, quant_state, entry, tensor):
+    nbytes = tensor.numel() * tensor.element_size()
+    if _DENSE_BYTES[0] + nbytes > DENSE_CACHE_MIB * 2**20:
+        return
+    try:
+        ref = weakref.ref(quant_state, lambda r, key=key, drop=_dense_drop: drop(key, r))
+    except TypeError:
+        return
+    _DENSE[key] = (ref, entry, tensor)
+    _DENSE_BYTES[0] += nbytes
+
+
+def dense_cache_clear():
+    """Drop every cached dense weight (tests; not used by the solution)."""
+    _DENSE.clear()
+    _DENSE_BYTES[0] = 0
 
 
 def _torch_dequant(packed, quant_state, n, k):
@@ -342,20 +463,49 @@ def _launch(packed, quant_state, count, out):
     out32 = out.view(-1).view(torch.int32)
     n_groups = count // 8
     # The caller must provide output storage disjoint from the input metadata.
+    # I3: torch.cuda.device only swaps the current device (no stream), so when the weight is
+    # already on the current device the launch is the same without it. The metadata tensor is
+    # asked instead of packed: _validate_inputs put both on one device (:217-224), and absmax is a
+    # plain tensor, while a Params4bit routes every method through its __torch_function__
+    # (bitsandbytes/nn/modules.py:446-484).
+    if USE_K1_FAST_HOST and quant_state.absmax.get_device() == torch.cuda.current_device():
+        _launch_here(packed, quant_state, n_groups, out32)
+        return
     # This context selects the device without creating a stream.
     with torch.cuda.device(packed.device):
-        soup_nf4_dequant_kernel[(triton.cdiv(n_groups, _ROWS),)](
+        _launch_here(packed, quant_state, n_groups, out32)
+
+
+def _launch_here(packed, quant_state, n_groups, out32):
+    _precompile.wait()  # v10d: a pending background compile finishes before our first launch
+    if USE_UNIFIED_SIG:  # C1: out32 fills the spare pointer slot (never read)
+        soup_nf4_dequant_usig[(triton.cdiv(n_groups, _ROWS),)](
             packed,
             quant_state.absmax,
             quant_state.state2.absmax,
             quant_state.state2.code,
             quant_state.offset,
             out32,
-            n_groups,
-            ROWS=_ROWS,
+            out32,
+            n_groups, 0, 0, 0,
+            0.0,
             num_warps=_NUM_WARPS,
             enable_fp_fusion=False,
         )
+        return
+    # Same arguments, constexprs and options as v6.1: no new Triton specialization.
+    soup_nf4_dequant_kernel[(triton.cdiv(n_groups, _ROWS),)](
+        packed,
+        quant_state.absmax,
+        quant_state.state2.absmax,
+        quant_state.state2.code,
+        quant_state.offset,
+        out32,
+        n_groups,
+        ROWS=_ROWS,
+        num_warps=_NUM_WARPS,
+        enable_fp_fusion=False,
+    )
 
 
 def nf4_dequantize(packed, quant_state, out=None):
@@ -372,8 +522,28 @@ def nf4_dequantize(packed, quant_state, out=None):
     works, but Triton compiles a second specialization for it; an odd element
     offset goes through a temporary.
     """
-    n, k = _checked_shape(packed, quant_state)
+    (n, k), entry = _checked_entry(packed, quant_state)
     count = n * k
+
+    # I3 dense cache (k_proj / v_proj only by default). Callers only read the result:
+    # SoupNF4Matmul F.linear / matmul below, mlp_recompute._dequantize_weight (MLP shapes, never
+    # cached). A hit needs the record that validated this very call and a live owner tensor, so
+    # the validated storage cannot have been freed and reused at the same address.
+    dense_key = None
+    if (
+        USE_DENSE_CACHE
+        and out is None
+        and entry is not None
+        and _dense_wanted((n, k))
+        and not torch.is_inference_mode_enabled()
+        and entry[1]() is not None
+    ):
+        dense_key = id(quant_state)
+        item = _DENSE.get(dense_key)
+        if item is not None:
+            if item[1] is entry and item[0]() is quant_state:
+                return item[2]
+            _dense_drop(dense_key)  # made under an older record: stale
 
     if out is not None:
         _check_tensor(out, "out", torch.float16, packed.device, count)
@@ -390,7 +560,14 @@ def nf4_dequantize(packed, quant_state, out=None):
         return out
 
     if out is None:
-        out = torch.empty((n, k), device=packed.device, dtype=torch.float16)
+        # I3: absmax's device == packed's (_validate_inputs), without Params4bit's
+        # __torch_function__ on the forward path.
+        device = quant_state.absmax.device if USE_K1_FAST_HOST else packed.device
+        out = torch.empty((n, k), device=device, dtype=torch.float16)
+        _launch(packed, quant_state, count, out)
+        if dense_key is not None:
+            _dense_store(dense_key, quant_state, entry, out)
+        return out
     elif out.storage_offset() % 2 != 0:
         # An int32 view needs a 4-byte aligned start.
         tmp = torch.empty((n, k), device=packed.device, dtype=torch.float16)
@@ -440,52 +617,83 @@ def _get_original_matmul_4bit():
     return _ORIGINAL_BNB_MATMUL_4BIT
 
 
-def soup_matmul_4bit(A, B, quant_state, out=None, bias=None):
-    # Same signature as bitsandbytes/autograd/_functions.py:407 matmul_4bit,
-    # which Linear4bit.forward reaches as `bnb.matmul_4bit`
-    # (bitsandbytes/nn/modules.py:637).
-    original = _get_original_matmul_4bit()
+# bnb's CUDA gemm_4bit takes dequant + F.linear for M > 1536 without asking
+# its heuristic (bitsandbytes/backends/cuda/ops.py:926 _gemm_4bit_custom_max_m,
+# :954-955).
+_BNB_CUSTOM_MAX_M = 1536
 
+# bitsandbytes.backends.cuda.ops, imported on first use (never at our import).
+# The module is cached, not the function: _gemm_4bit_use_custom_fn is read as
+# an attribute on every call, so a monkeypatched heuristic (tests/test_nf4.py)
+# is still seen. bnb caches the decision itself (ops.py:583-584,
+# functools.cache), so what this saves is the per-call `from ... import`.
+_BNB_CUDA_OPS = None
+
+
+def _bnb_cuda_ops():
+    global _BNB_CUDA_OPS
+    ops = _BNB_CUDA_OPS
+    if ops is None:
+        import bitsandbytes.backends.cuda.ops as ops
+
+        _BNB_CUDA_OPS = ops
+    return ops
+
+
+def k1_dense_path(A, B, quant_state):
+    """True exactly when soup_matmul_4bit(A, B, quant_state) (out=None) takes
+    SoupNF4Matmul, i.e. computes F.linear(A, nf4_dequantize(B, quant_state)).
+
+    False for everything bnb keeps: non-CUDA / non-fp16 / 0-d A, a weight K1
+    refuses, a device or width mismatch, M <= 4, and M <= 1536 when bnb's
+    private heuristic picks its custom 4-bit GEMM (ops.py:921-926, 954-964).
+    A failing or missing heuristic returns False (bnb's path), as before.
+    """
     if (
         not isinstance(A, torch.Tensor)
         or not A.is_cuda
         or A.dtype != torch.float16
         or A.ndim == 0
-        or out is not None
     ):
-        return original(A, B, quant_state=quant_state, out=out, bias=bias)
+        return False
 
     try:
         n, k = _checked_shape(B, quant_state)
     except (TypeError, ValueError):
-        return original(A, B, quant_state=quant_state, out=out, bias=bias)
+        return False
 
     if A.device != B.device or A.shape[-1] != k:
-        return original(A, B, quant_state=quant_state, out=out, bias=bias)
+        return False
 
     m = A.numel() // k
     if m <= 4:
-        return original(A, B, quant_state=quant_state, out=out, bias=bias)
+        return False
 
-    # bnb takes dequant + F.linear for M > 1536 and otherwise asks its private
-    # heuristic (bitsandbytes/backends/cuda/ops.py:921-926, 954-964); we only
-    # replace the dequant + F.linear path.
-    if m <= 1536:
+    if m <= _BNB_CUSTOM_MAX_M:
         try:
-            from bitsandbytes.backends.cuda.ops import (
-                _gemm_4bit_use_custom_fn,
-            )
-
             use_custom = bool(
-                _gemm_4bit_use_custom_fn(A.device.index, A.dtype, m, n, k)
+                _bnb_cuda_ops()._gemm_4bit_use_custom_fn(
+                    A.device.index, A.dtype, m, n, k
+                )
             )
         except Exception:
             # An unavailable or failing private API must preserve bnb's path.
-            return original(A, B, quant_state=quant_state, out=out, bias=bias)
-
+            return False
         if use_custom:
-            return original(A, B, quant_state=quant_state, out=out, bias=bias)
+            return False
 
+    return True
+
+
+def soup_matmul_4bit(A, B, quant_state, out=None, bias=None):
+    # Same signature as bitsandbytes/autograd/_functions.py:407 matmul_4bit,
+    # which Linear4bit.forward reaches as `bnb.matmul_4bit`
+    # (bitsandbytes/nn/modules.py:637). We only replace bnb's
+    # dequant + F.linear path; k1_dense_path decides when that is.
+    if out is not None or not k1_dense_path(A, B, quant_state):
+        return _get_original_matmul_4bit()(
+            A, B, quant_state=quant_state, out=out, bias=bias
+        )
     return SoupNF4Matmul.apply(A, B, quant_state, bias)
 
 

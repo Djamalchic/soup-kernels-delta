@@ -48,6 +48,12 @@ SDPA keeps one head per GQA group of its repeated key/value; D: LoRA keep-masks 
 keep only the real rows), and with K3 the add + norm + S4 MLP + residual add run as
 solution/fused_block.py's single node, which saves (r, a) instead of (r_mid, x16).
 
+v7 I4 (S4_OFF_FRACTION, 0.0 = v6.1): the first int(num_hidden_layers * S4_OFF_FRACTION) layers
+skip B and S4 and run K3's add_rmsnorm + K4's MLP, which keeps fp16 gate/up for backward instead
+of recomputing them (same bits; see _mlp_no_recompute). First layers, because their backward runs
+last, when most saved activations are already freed, so K4's larger backward transient (fresh
+dgate/dup next to the kept gate/up) stays off the step's peak.
+
 No Triton kernel here (gather/scatter are torch index ops); nothing runs on CUDA at import or patch
 time. Idea credit: removing padding for token-wise ops as in ByteDance's Effective Transformer and
 the "unpad" path of FlashAttention's varlen BERT; code written from scratch.
@@ -61,8 +67,16 @@ import torch
 
 USE_UNPAD = False  # read by solution.apply(); False keeps the base Qwen2Model.forward untouched
 
+# v7 I4: the first int(num_hidden_layers * S4_OFF_FRACTION) packed layers skip S4 + B and run the
+# K3 add_rmsnorm + K4 MLP (fp16 gate/up kept for backward, no recompute). Same values bit for bit
+# (see _mlp_no_recompute); it spends memory (~38 KiB per real token per layer, 32 KiB on layer 0)
+# to save the gate/up recompute GEMMs and dequants. A fraction, not a count, so 2-3-layer test
+# models get 0 off layers. solution.apply() sets it; 0.0 is exactly v6.1.
+S4_OFF_FRACTION = 0.0
+
 _MARK = "_soup_delta_unpad"
 _K3_MARK = "_soup_delta_addnorm"  # = solution/layers.py _MARK (K3)
+_S4_MARK = "_soup_delta_mlp_recompute"  # = solution/mlp_recompute.py _PATCH_MARK (:59)
 
 # At M <= 128 bitsandbytes on a T4 (sm75) runs gate/up through its own small-M GEMM, and down at
 # M <= 64 (bitsandbytes/backends/cuda/ops.py:703-709; M = A.numel() // K at :947-948), i.e. not
@@ -75,7 +89,9 @@ _MIN_PAD_DIV = 32
 _HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
 
 # Calls that took each path. Python ints only; tests and a debug notebook read them.
-COUNTS = {"packed": 0, "original": 0}
+# "s4_off": packed layers whose MLP ran K4 directly (I4); "s4_off_fallback": I4 wanted but the MLP
+# was called as a module (guards failed), i.e. v6.1's S4 path.
+COUNTS = {"packed": 0, "original": 0, "s4_off": 0, "s4_off_fallback": 0}
 
 # Real classes and functions captured by patch_qwen2_model_unpad(); Soup's tests may replace
 # sys.modules["torch"] later (tests/test_callback.py:165-174), so nothing is re-imported per call.
@@ -324,6 +340,56 @@ def _delta_ok(residual, delta):
 
 
 # ---------------------------------------------------------------------------------------------
+# v7 I4: S4 off on the first layers
+# ---------------------------------------------------------------------------------------------
+
+def s4_off_count(n_layers):
+    """int(n_layers * S4_OFF_FRACTION): 28 -> 7 and 3 -> 0 at 0.25, 2 -> 0. 0 for odd values."""
+    frac = S4_OFF_FRACTION
+    if isinstance(frac, bool) or not isinstance(frac, (int, float)) or not 0.0 <= frac <= 1.0:
+        return 0  # NaN fails the range check too
+    if isinstance(n_layers, bool) or not isinstance(n_layers, int) or n_layers <= 0:
+        return 0
+    return int(n_layers * frac)
+
+
+def _k4_forward(mlp):
+    """The forward S4 itself falls back to, when it may be called directly on this module.
+
+    S4's class patch keeps the forward it wrapped (K4) in `__wrapped__` and calls exactly that
+    when it does not recompute (solution/mlp_recompute.py:365, 386, 390). Calling it directly
+    skips only Module.__call__, which with no hooks on the module (checked here) and no global
+    hooks (checked by _fast_path_ok) does nothing else. Qwen2MLP has no transformers capture hooks
+    (modeling_qwen2.py:314-317 records decoder layers and attention only). None otherwise. Reads only.
+    """
+    if type(mlp) is not _REFS.get("mlp_cls") or not _hookless(mlp):
+        return None
+    fwd = type(mlp).forward
+    if not getattr(fwd, _S4_MARK, False):
+        return None  # S4 not installed: the module call already is the no-recompute path
+    inner = getattr(fwd, "__wrapped__", None)
+    return inner if callable(inner) else None
+
+
+def _mlp_no_recompute(mlp, y):
+    """mlp(y) without S4's recompute: K4 keeps the fp16 gate/up for backward instead.
+
+    Bit-identical to S4 (tests/test_mlp_recompute.py:103-118 checks torch.equal of outputs and
+    input grads against K4), and so to B (tests/test_peak_v6.py:245-275 checks B == K3 + S4).
+    Any guard failure calls the module, which is v6.1's unfused S4 path (same values again).
+    """
+    try:
+        inner = _k4_forward(mlp)
+    except Exception:  # noqa: BLE001 - a read-only guard; nothing ran yet
+        inner = None
+    if inner is None:
+        COUNTS["s4_off_fallback"] += 1
+        return mlp(y)
+    COUNTS["s4_off"] += 1
+    return inner(mlp, y)
+
+
+# ---------------------------------------------------------------------------------------------
 # The packed forward
 # ---------------------------------------------------------------------------------------------
 
@@ -335,13 +401,79 @@ def _attention_scope(idx, batch, seq, width):
     return contextlib.nullcontext()
 
 
-def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3):
-    """One decoder layer, modeling_qwen2.py:279-298, with the token-wise ops on [N, C]."""
+def _lora_source_scope(norm, r, x_bt, idx):
+    """v9 M2: solution/lora_recompute.py source_scope when its flag is on, else a no-op context.
+    The scope runs its own guards (reads only) and is a no-op when they fail."""
+    m2 = _REFS.get("lora_recompute")
+    if m2 is None or not m2.USE_LORA_INPUT_RECOMPUTE:
+        return contextlib.nullcontext()
+    return m2.source_scope(norm, r, x_bt, idx, _REFS["norm_cls"])
+
+
+def _causal_scope(mask, batch, seq):
+    """v7 I1: solution/sdpa_recompute.py causal_mask_scope(mask) when A1's USE_CAUSAL_PADDED is on
+    and `mask` provably is causal AND (validated right-) padding, else a no-op context. Reads only.
+
+    Provenance (transformers 5.16.1): mask came from the module-level create_causal_mask of
+    modeling_qwen2 (imported from masking_utils, modeling_qwen2.py:16), called by us with a 2D mask,
+    position_ids and no or/and mask function or block ids (_packed_forward), so with sdpa's mask
+    interface it is causal_mask_function AND padding_mask_function (masking_utils.py:946-996,
+    496-518; no packed-sequence mask with a 2D mask, :851-857). Both functions must be the genuine
+    ones, and the result a [B, 1, T, T] bool tensor (no skip to None)."""
+    a1 = _REFS.get("sdpa_recompute")
+    if a1 is None or not getattr(a1, "USE_CAUSAL_PADDED", False):
+        return contextlib.nullcontext()
+    if not _causal_padding_mask(mask, batch, seq):
+        return contextlib.nullcontext()
+    return a1.causal_mask_scope(mask)
+
+
+def _causal_padding_mask(mask, batch, seq):
+    """True when `mask` provably is causal AND padding (provenance in _causal_scope). Reads only."""
+    mu = _REFS.get("masking")
+    if mu is None:
+        return False
+    try:
+        return bool(isinstance(mask, torch.Tensor) and mask.dtype == torch.bool
+                    and tuple(mask.shape) == (batch, 1, seq, seq)
+                    and _REFS["modeling"].create_causal_mask is mu.create_causal_mask
+                    and mu.ALL_MASK_ATTENTION_FUNCTIONS["sdpa"] is mu.sdpa_mask
+                    and mu.causal_mask_function is _REFS.get("causal_mask_function"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _row_scope(mask, idx, batch, seq):
+    """v9 M3: solution/sdpa_recompute.py row_compact_scope(mask, idx, batch, seq) when A1's
+    USE_ROW_COMPACT is on and `mask` provably is causal AND padding, else a no-op context.
+
+    A1 may then keep q/k/v of the real rows only: on this path every pad query row's output is
+    dropped by pack_rows after self_attn (its dO is exactly 0) and, with this mask or I1's causal
+    call on right-padded rows, no real query sees a pad key (proof in sdpa_recompute.py). Reads
+    only; the scope makes its two [N] index vectors lazily, inside A1's guarded call."""
+    a1 = _REFS.get("sdpa_recompute")
+    if a1 is None or not getattr(a1, "USE_ROW_COMPACT", False):
+        return contextlib.nullcontext()
+    if not _causal_padding_mask(mask, batch, seq):
+        return contextlib.nullcontext()
+    return a1.row_compact_scope(mask, idx, batch, seq)
+
+
+def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3,
+                  s4_off=False):
+    """One decoder layer, modeling_qwen2.py:279-298, with the token-wise ops on [N, C].
+
+    s4_off (v7 I4): no fused block B and no S4 recompute in this layer; K3's add_rmsnorm (or the
+    plain ops) and K4's MLP that keeps gate/up. Same values; more memory, less backward work.
+    """
     x = layer.input_layernorm(r)  # line 280, row-wise
     x_bt = unpack_rows(x, idx, batch, seq)  # exact zeros on the padding rows
     del x
     # v6 A + D (solution/saved_compact.py): smaller saved tensors inside attention, same values.
-    with _attention_scope(idx, batch, seq, x_bt.shape[-1]):
+    # v9 M2 (solution/lora_recompute.py): LoRA layers fed exactly x_bt keep no LoRA-A input and
+    # rebuild it from r in backward (entered second, so its lora_A hooks are the innermost).
+    with _attention_scope(idx, batch, seq, x_bt.shape[-1]), \
+            _lora_source_scope(layer.input_layernorm, r, x_bt, idx):
         a_bt, _ = layer.self_attn(  # lines 282-290: the same arguments and kwargs, base shapes
             hidden_states=x_bt,
             attention_mask=mask,
@@ -356,23 +488,25 @@ def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, 
     del a_bt
     ln2 = layer.post_attention_layernorm
     if k3 is not None:
-        # v6 B (solution/fused_block.py): add + norm + S4 MLP + residual add as one node that
-        # saves (r, a) instead of (r_mid, x16); bit-identical to the ops below.
-        fb = _REFS.get("fused_block")
-        try:  # a guard reads only; evaluating it consumes no RNG, so falling through is safe
-            fused = fb is not None and fb.fused_ok(layer, r, a, _REFS["mlp_cls"], _REFS["norm_cls"])
-        except Exception:  # noqa: BLE001
-            fused = False
-        if fused:
-            return fb.add_norm_mlp(r, a, layer)
+        if not s4_off:
+            # v6 B (solution/fused_block.py): add + norm + S4 MLP + residual add as one node that
+            # saves (r, a) instead of (r_mid, x16); bit-identical to the ops below.
+            fb = _REFS.get("fused_block")
+            try:  # a guard reads only; evaluating it consumes no RNG, so falling through is safe
+                fused = fb is not None and fb.fused_ok(layer, r, a, _REFS["mlp_cls"], _REFS["norm_cls"])
+            except Exception:  # noqa: BLE001
+                fused = False
+            if fused:
+                return fb.add_norm_mlp(r, a, layer)
         add_rmsnorm, norm_ok = k3
         weight = getattr(ln2, "weight", None)
         # The conditions of K3's own layer patch (solution/layers.py), on [N, C].
         if _plain_norm(ln2) and norm_ok(r, weight) and _delta_ok(r, a):
             r, y = add_rmsnorm(r, a, weight, ln2.variance_epsilon)
-            return r + layer.mlp(y)  # lines 296-297
+            return r + (_mlp_no_recompute(layer.mlp, y) if s4_off else layer.mlp(y))  # lines 296-297
     r = r + a  # line 291: fp32 + fp16 -> fp32, the same elementwise values as base
-    return r + layer.mlp(ln2(r))  # lines 294-297
+    y = ln2(r)  # line 295
+    return r + (_mlp_no_recompute(layer.mlp, y) if s4_off else layer.mlp(y))  # lines 296-297
 
 
 def _packed_forward(model, input_ids, attention_mask, idx, use_cache, kwargs, mode):
@@ -397,8 +531,13 @@ def _packed_forward(model, input_ids, attention_mask, idx, use_cache, kwargs, mo
         del embeds
 
         k3 = _k3_ops() if mode == "k3" else None
-        for layer in model.layers[: model.config.num_hidden_layers]:  # line 387
-            r = _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3)
+        n_layers = model.config.num_hidden_layers
+        n_off = s4_off_count(n_layers)  # v7 I4: the first n_off layers keep gate/up (no S4)
+        # v7 I1: SDPA may take is_causal=True for this mask; v9 M3: A1 may save real rows only.
+        with _causal_scope(mask, batch, seq), _row_scope(mask, idx, batch, seq):
+            for i, layer in enumerate(model.layers[:n_layers]):  # line 387
+                r = _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache,
+                                  kwargs, k3, s4_off=i < n_off)
         hidden = model.norm(r)  # line 398, row-wise
     finally:
         if collector is not None:
@@ -474,11 +613,21 @@ def patch_qwen2_model_unpad():
                 layer_forward=(layer_forward if _is_genuine(layer_forward, mq.__name__,
                                                             "Qwen2DecoderLayer.forward") else None))
     # v6 helpers (pure Python, no CUDA at import); missing ones just keep v5's ops.
-    for key, name in (("fused_block", "fused_block"), ("saved_compact", "saved_compact")):
+    for key, name in (("fused_block", "fused_block"), ("saved_compact", "saved_compact"),
+                      ("sdpa_recompute", "sdpa_recompute"), ("lora_recompute", "lora_recompute")):
         try:
             refs[key] = importlib.import_module(f"{__package__}.{name}")
         except Exception:  # noqa: BLE001
             refs[key] = None
+    try:  # v7 I1: the genuine mask builders, captured now (Soup's tests may swap modules later)
+        from transformers import masking_utils as mu
+
+        mu.create_causal_mask, mu.sdpa_mask, mu.ALL_MASK_ATTENTION_FUNCTIONS  # noqa: B018
+        refs["masking"] = mu
+        refs["causal_mask_function"] = mu.causal_mask_function
+    except Exception:  # noqa: BLE001 - without them I1 stays off
+        refs["masking"] = None
+        refs["causal_mask_function"] = None
     try:
         from transformers.utils import output_capturing as oc
 

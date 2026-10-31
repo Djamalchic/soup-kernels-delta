@@ -376,3 +376,159 @@ def test_import_touches_no_cuda():
             "assert m.USE_MLP_RECOMPUTE is False; "
             "assert not torch.cuda.is_initialized()")
     subprocess.run([sys.executable, "-c", code], cwd=root, check=True)
+
+
+# ---------------------------------------------------------------------------------------------
+# v7 I2: S4_DEQUANT_REUSE ("both" / "up") against v6.1 ("off"), at the model's real widths
+# ---------------------------------------------------------------------------------------------
+
+C, I = 1536, 8960  # Qwen2.5-1.5B hidden / intermediate
+REUSE_MODES = ("off", "both", "up")
+# Expected nf4_dequantize calls in steps 2-4 when K1 would run gate/up as dequant + F.linear.
+DEQUANTS = {"off": 4, "both": 2, "up": 3}
+_PROJS = ("gate_proj", "up_proj", "down_proj")
+
+
+def _fp16_linear4bit(n_in, n_out):
+    """Linear4bit quantized from an fp16 weight, so quant_state.dtype is fp16 and K1 takes it
+    (as tests/test_peak_v6.py fp16_linear4bit; the real run loads the model in fp16)."""
+    lin = bnb.nn.Linear4bit(n_in, n_out, bias=False, compute_dtype=torch.float16,
+                            compress_statistics=True, quant_type="nf4")
+    lin.weight.data = lin.weight.data.to(torch.float16)
+    return lin
+
+
+@pytest.fixture(scope="module")
+def real_mlp():
+    torch.manual_seed(0)
+    cfg = Qwen2Config(hidden_size=C, intermediate_size=I, hidden_act="silu")
+    mlp = modeling_qwen2.Qwen2MLP(cfg)
+    for name, (n_in, n_out) in {"gate_proj": (C, I), "up_proj": (C, I),
+                                "down_proj": (I, C)}.items():
+        setattr(mlp, name, _fp16_linear4bit(n_in, n_out))
+    mlp = mlp.cuda()
+    assert all(getattr(mlp, n).weight.quant_state.dtype == torch.float16 for n in _PROJS)
+    return mlp
+
+
+@contextlib.contextmanager
+def _count_dequants(monkeypatch):
+    """Counts K1 dequant launches: SoupNF4Matmul.forward/backward and mlp_recompute both look
+    nf4_dequantize up in the nf4 module at call time."""
+    calls = []
+    real = nf4.nf4_dequantize
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(nf4, "nf4_dequantize", counting)
+    try:
+        yield calls
+    finally:
+        monkeypatch.setattr(nf4, "nf4_dequantize", real)
+
+
+def _dense(mlp, n):
+    probe = torch.empty(n, C, device="cuda", dtype=torch.float16)
+    w = mlp.up_proj.weight
+    return nf4.k1_dense_path(probe, w, w.quant_state)
+
+
+def _count_delta(before):
+    return {k: rc.REUSE_COUNTS[k] - before[k] for k in before}
+
+
+@pytest.mark.parametrize("n", [129, 320, 800, 1800])
+def test_dequant_reuse_helper_bit_exact_and_fewer_dequants(real_mlp, base_forward, monkeypatch, n):
+    set_k1(monkeypatch, True)
+    torch.manual_seed(n)
+    x16 = torch.randn(n, C, device="cuda", dtype=torch.float16)
+    dh = torch.randn(n, I, device="cuda", dtype=torch.float16)
+    dense = _dense(real_mlp, n)
+    if n > 1536:
+        assert dense  # bnb never asks its heuristic past M = 1536 (backends/cuda/ops.py:954-955)
+
+    res = {}
+    for mode in REUSE_MODES:
+        monkeypatch.setattr(rc, "S4_DEQUANT_REUSE", mode)
+        before = dict(rc.REUSE_COUNTS)
+        with _count_dequants(monkeypatch) as calls, torch.no_grad():  # backward runs without grad
+            dx = rc._gate_up_input_grad([dh.clone()], x16, real_mlp.gate_proj, real_mlp.up_proj)
+        torch.cuda.synchronize()
+        res[mode] = (dx, len(calls), _count_delta(before))
+
+    for mode in REUSE_MODES:
+        dx, n_deq, delta = res[mode]
+        assert dx.dtype == torch.float16 and torch.equal(dx, res["off"][0]), mode
+        if mode == "off":
+            assert delta == {"both": 0, "up": 0, "fallback": 0}
+            assert n_deq == (4 if dense else 2)  # not dense: bnb's own 4-bit GEMM recomputes g, u
+        elif dense:
+            assert delta == {"both": int(mode == "both"), "up": int(mode == "up"), "fallback": 0}
+            assert n_deq == DEQUANTS[mode], (mode, n_deq)
+        else:  # bnb's custom GEMM ran gate/up in the forward: v6.1 code, reported as a fallback
+            assert delta == {"both": 0, "up": 0, "fallback": 1}
+            assert n_deq == 2
+
+
+def test_dequant_reuse_refuses_saved_gate_and_inactive_k1(real_mlp, base_forward, monkeypatch):
+    x16 = torch.randn(1800, C, device="cuda", dtype=torch.float16)
+    g = torch.empty(1800, I, device="cuda", dtype=torch.float16)
+    set_k1(monkeypatch, True)
+    assert rc._reuse_nf4("both", x16, real_mlp.gate_proj, real_mlp.up_proj, None) is nf4
+    assert rc._reuse_nf4("up", x16, real_mlp.gate_proj, real_mlp.up_proj, g) is nf4
+    assert rc._reuse_nf4("both", x16, real_mlp.gate_proj, real_mlp.up_proj, g) is None
+    assert rc._reuse_nf4("both", x16.float(), real_mlp.gate_proj, real_mlp.up_proj, None) is None
+    real_mlp.up_proj.forward = real_mlp.up_proj.forward  # an instance-level forward (accelerate hooks)
+    try:
+        assert rc._reuse_nf4("both", x16, real_mlp.gate_proj, real_mlp.up_proj, None) is None
+    finally:
+        del real_mlp.up_proj.__dict__["forward"]
+    set_k1(monkeypatch, False)  # bnb's own matmul_4bit ran the forward: nothing to reuse
+    assert rc._reuse_nf4("both", x16, real_mlp.gate_proj, real_mlp.up_proj, None) is None
+
+
+class _Lora(torch.nn.Module):
+    """x + B(A(x)) * 2: a trainable pair upstream of the MLP, so its grads go through dx16."""
+
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Linear(C, 16, bias=False)
+        self.b = torch.nn.Linear(16, C, bias=False)
+        torch.nn.init.normal_(self.b.weight, std=0.02)
+
+    def forward(self, x):
+        return x + self.b(self.a(x)) * 2.0
+
+
+@pytest.mark.parametrize("n", [129, 800, 1800])
+def test_dequant_reuse_end_to_end_bit_exact(real_mlp, base_forward, monkeypatch, n):
+    """Soup's setting: fp32 residual input, fp16 autocast forward, backward outside autocast."""
+    set_k1(monkeypatch, True)
+    torch.manual_seed(1)
+    lora = _Lora().cuda()
+    x = torch.randn(n, C, device="cuda")
+    grad = torch.randn(n, C, device="cuda")
+    dense = _dense(real_mlp, n)
+
+    res = {}
+    for mode in REUSE_MODES:
+        monkeypatch.setattr(rc, "S4_DEQUANT_REUSE", mode)
+        monkeypatch.setattr(rc, "USE_MLP_RECOMPUTE", True)
+        lora.zero_grad(set_to_none=True)
+        xi = x.clone().requires_grad_(True)
+        before = dict(rc.REUSE_COUNTS)
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = real_mlp(lora(xi))
+        assert uses_s4(out)
+        out.backward(grad)
+        delta = _count_delta(before)
+        res[mode] = (out.detach(), xi.grad, lora.a.weight.grad.clone(), lora.b.weight.grad.clone())
+        if mode != "off":
+            assert delta[mode] + delta["fallback"] == 1
+            assert delta[mode] == int(dense)
+
+    for mode in ("both", "up"):
+        for new, ref in zip(res[mode], res["off"]):
+            assert torch.equal(new, ref), mode
