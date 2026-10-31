@@ -16,6 +16,7 @@ from solution import (  # noqa: E402
     head_loss,
     lora_recompute,
     lora_replay,
+    merged_qkv,
     mlp_recompute,
     precompile,
     saved_compact,
@@ -28,7 +29,7 @@ from solution import (  # noqa: E402
 def recorder(monkeypatch):
     """Replace every patch function apply() calls; restore every flag it writes afterwards."""
     calls = []
-    result = {"a1": True, "a": True, "m2": True}
+    result = {"a1": True, "a": True, "m2": True, "q": True}
 
     def rec(name, value=True):
         def fn(*a, **k):
@@ -46,6 +47,7 @@ def recorder(monkeypatch):
     monkeypatch.setattr(lora_replay, "patch_lora_dropout_replay", rec("a2"))
     monkeypatch.setattr(lora_recompute, "patch_lora_input_recompute",  # v9 M2
                         rec("m2", lambda: result["m2"]))
+    monkeypatch.setattr(merged_qkv, "install", rec("q", lambda: result["q"]))  # v11 Q
     # v10d: a wiring test never starts the real background compile (it would compile in this
     # process once an earlier GPU test has created the CUDA context, and patch Qwen2ForCausalLM
     # for good); test_precompile.py covers start_overlap() / wait() / patch_forward_join().
@@ -59,7 +61,9 @@ def recorder(monkeypatch):
                       (lora_replay, "USE_LORA_DROPOUT_REPLAY"), (head_loss, "STORE_HEAD_FP16"),
                       (lora_recompute, "USE_LORA_INPUT_RECOMPUTE"),
                       (lora_recompute, "USE_LORA_EPILOGUE"),  # v10 P2
-                      (lora_recompute, "USE_LORA_NO_CLONE")):  # v10 P2
+                      (lora_recompute, "USE_LORA_NO_CLONE"),  # v10 P2
+                      (merged_qkv, "USE_MERGED_QKV"), (merged_qkv, "MERGED_QKV_CACHE"),  # v11 Q
+                      (merged_qkv, "MERGED_CACHE_MIB")):
         monkeypatch.setattr(mod, flag, getattr(mod, flag))
     from solution import mlp
     from solution.kernels import addnorm, head_ce, nf4  # v7 I3 / v8 C1: apply() writes these too
@@ -82,7 +86,8 @@ def recorder(monkeypatch):
                  "USE_SDPA_ROW_COMPACT",  # v9 M3
                  "USE_BWD_CHUNKING", "BWD_ROW_CHUNKS", "BWD_CHUNK_MIN_ROWS", "K2_VOCAB_TILE",  # M5
                  "USE_ELEMENTWISE_FUSION", "EW_K3_FP16", "EW_LORA_EPILOGUE",  # v10 P2
-                 "EW_LORA_NO_CLONE"):
+                 "EW_LORA_NO_CLONE",
+                 "USE_MERGED_QKV", "MERGED_QKV_CACHE", "MERGED_QKV_CACHE_MIB"):  # v11 Q
         monkeypatch.setattr(solution, flag, getattr(solution, flag))
     return calls, result
 
@@ -312,3 +317,50 @@ def test_m3_off_without_its_prerequisites(recorder, monkeypatch, case):
         monkeypatch.setattr(solution, "USE_SDPA_ROW_COMPACT", False)
     solution.apply()
     assert sdpa_recompute.USE_ROW_COMPACT is False
+
+
+# v11 Q: merged q/k/v projection, wired as U + M2 + its own flag; install() only captures classes.
+
+def test_q_default_is_on_with_m2_and_u(recorder):
+    calls, _ = recorder
+    assert solution.USE_MERGED_QKV is True and solution.MERGED_QKV_CACHE is False
+    assert merged_qkv.USE_MERGED_QKV is False  # module default: v10d until apply() runs
+    solution.apply()
+    assert "q" in calls and calls.index("m2") < calls.index("q")
+    assert merged_qkv.USE_MERGED_QKV is True
+    assert merged_qkv.MERGED_QKV_CACHE is False and merged_qkv.MERGED_CACHE_MIB == 192
+
+
+@pytest.mark.parametrize("case", ["flag_off", "m2_refused", "m2_off", "u_off", "install_fails"])
+def test_q_off_without_its_prerequisites(recorder, monkeypatch, case):
+    calls, result = recorder
+    if case == "flag_off":
+        monkeypatch.setattr(solution, "USE_MERGED_QKV", False)
+    elif case == "m2_refused":
+        result["m2"] = False
+    elif case == "m2_off":
+        monkeypatch.setattr(solution, "USE_LORA_INPUT_RECOMPUTE", False)
+    elif case == "u_off":
+        monkeypatch.setattr(solution, "USE_UNPAD", False)
+    else:
+        result["q"] = False
+    solution.apply()
+    assert merged_qkv.USE_MERGED_QKV is False
+    assert ("q" in calls) is (case == "install_fails")
+
+
+def test_q_cache_flag_is_forwarded(recorder, monkeypatch):
+    monkeypatch.setattr(solution, "MERGED_QKV_CACHE", True)
+    monkeypatch.setattr(solution, "MERGED_QKV_CACHE_MIB", 200)
+    solution.apply()
+    assert merged_qkv.MERGED_QKV_CACHE is True and merged_qkv.MERGED_CACHE_MIB == 200
+
+
+def test_q_refuses_fake_objects_without_running_anything(monkeypatch):
+    """Soup's tests pass fake modules: the guard answers None (nothing ran), never raises."""
+    monkeypatch.setattr(merged_qkv, "USE_MERGED_QKV", True)
+    before = dict(merged_qkv.COUNTS)
+    for attn in (object(), None, type("FakeAttention", (), {"q_proj": 1})()):
+        assert merged_qkv.attention_forward(attn, object(), None, (None, None), {}) is None
+    assert merged_qkv.COUNTS["merged"] == before["merged"]
+    assert merged_qkv.COUNTS["original"] == before["original"] + 3

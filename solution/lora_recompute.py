@@ -380,6 +380,13 @@ def _forward_recompute(layer, x, name, src):
         result = layer.base_layer(x)  # :527
         if not USE_LORA_NO_CLONE:
             result = result.clone()  # :533 (P2 skips it: an identity before an out-of-place add)
+    return _lora_tail(layer, x, name, src, scaling, scale, base16, result)
+
+
+def _lora_tail(layer, x, name, src, scaling, scale, base16, result):
+    """The LoRA half of _forward_recompute (bnb.py:536-552), after the base output: the fp16
+    base16 for the epilogue (scale set), else the fp32 `result`. v11 Q's merged q/k/v path
+    (solution/merged_qkv.py, forward_from_base16) enters here with its own base16."""
     lora_A = layer.lora_A[name]
     lora_B = layer.lora_B[name]
     p = float(layer.lora_dropout[name].p)
@@ -410,6 +417,49 @@ def _forward_recompute(layer, x, name, src):
         return result + output  # :552
     output = lora_B(h) * scaling  # :549
     return result + output  # :552, :565
+
+
+# ---------------------------------------------------------------------------------------------
+# v11 Q (solution/merged_qkv.py): the LoRA half for a base output computed by the merged GEMM
+# ---------------------------------------------------------------------------------------------
+
+def merged_adapter(layer, x):
+    """The adapter name when the module call `layer(x)` would run _forward_recompute right now,
+    so the merged q/k/v path may run forward_from_base16 instead; else None. The class forward
+    must be our wrapper (outermost, see patch_lora_input_recompute) and the instance hook-free,
+    because the merged path calls no Module.__call__ for this layer. Reads only."""
+    if not USE_LORA_INPUT_RECOMPUTE or "cls" not in _REFS:
+        return None
+    cls = _REFS["cls"]
+    if type(layer) is not cls or not getattr(cls.forward, _MARK, False) or not _hookless(layer):
+        return None
+    src = _SOURCE.get()
+    if src is None or src.x_bt is not x:
+        return None
+    return _adapter(layer, x)
+
+
+def current_source():
+    """The active M2 source (unpad._layer_packed's scope), or None. Reads only."""
+    return _SOURCE.get()
+
+
+def forward_from_base16(layer, x, name, src, base16):
+    """_forward_recompute with the base output given: base16 is `layer.base_layer`'s fp16 matmul
+    output before Linear4bit's `.to(inp_dtype)` (bitsandbytes nn/modules.py:637), here a slice
+    of the merged q/k/v GEMM. The LoRA half is the same code (_lora_tail): the same RNG state
+    read, the same dropout draw, lora_A / lora_B module calls, epilogue or `.to(fp32)` + add.
+    The caller checked merged_adapter(layer, x) == name and src is current_source()."""
+    COUNTS["recompute"] += 1
+    layer._check_forward_args(x)  # :514
+    scaling = layer.scaling[name]
+    scale = _fp16_exact_scale(scaling) if USE_LORA_EPILOGUE else None
+    if scale is not None and _epilogue_base(layer):
+        return _lora_tail(layer, x, name, src, scaling, scale, base16, None)
+    result = base16.to(x.dtype)  # Linear4bit's `.to(inp_dtype)` of the fp16 matmul (:637)
+    if not USE_LORA_NO_CLONE:
+        result = result.clone()  # peft's defensive clone (bnb.py:533)
+    return _lora_tail(layer, x, name, src, scaling, None, None, result)
 
 
 def patch_lora_input_recompute():

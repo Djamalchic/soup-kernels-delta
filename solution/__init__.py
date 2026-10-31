@@ -88,10 +88,16 @@ precompile.py`: at the end of apply() one thread compiles the five kernels the r
 (JITFunction.warmup with their production argument kinds: same cache keys, same binaries, same
 values) while Soup builds the model; the first Qwen2ForCausalLM.forward, and every launch helper of
 ours, joins it first. The compile time stays inside the measured run, with the same empty cache.
+v11 Q (USE_MERGED_QKV, flags below), `solution/merged_qkv.py`: on U's packed path q_proj / k_proj /
+v_proj base projections run as ONE fp16 GEMM against [W_q; W_k; W_v] ([2048, 1536], rows from K1's
+bit-exact dequant), split into q / k / v inside one autograd node whose backward is ONE dX GEMM;
+the q / v LoRA halves are M2's code unchanged (same dropout draws, same order). Not bit-identical:
+cuBLAS's N = 2048 kernel may round an output element to the neighbouring fp16 value, and dX is
+summed in fp32 inside the GEMM and rounded once (tests/test_merged_qkv.py tolerances).
 """
 
-from . import fused_block, head_loss, lora_recompute, lora_replay, mlp, mlp_recompute, precompile
-from . import saved_compact, sdpa_recompute, unpad
+from . import fused_block, head_loss, lora_recompute, lora_replay, merged_qkv, mlp, mlp_recompute
+from . import precompile, saved_compact, sdpa_recompute, unpad
 from .head_loss import patch_head_loss
 from .kernels.nf4 import patch_bnb_matmul_4bit
 from .layers import patch_qwen2_decoder_layer, patch_qwen2_rmsnorm
@@ -195,6 +201,19 @@ EW_LORA_NO_CLONE = True
 # Soup's model loading [estimate -1...-2.5 s of wall]. False = v10c.
 USE_PRECOMPILE_OVERLAP = True
 
+# v11 Q (solution/merged_qkv.py; needs U, K1 and M2, which supplies the LoRA halves): q/k/v base
+# projections as one GEMM per layer and one dX GEMM in backward; one x -> fp16 cast instead of
+# three; x's gradient sums 3 contributions instead of 5. Per step at P = 2048 [estimate]: ~-4 ms
+# forward (two casts, the N = 256 GEMMs' poor T4 fill) and ~-11 ms backward (two fp16 -> fp32
+# casts and two fp32 adds of [P, 1536], one GEMM instead of three), minus ~2 ms for the q / v
+# copies and the gradient concat. False = v10d exactly.
+# MERGED_QKV_CACHE: keep [W_q; W_k; W_v] for the run (I3's k / v entries become views of it):
+# +126 MiB static [28 x 1536 x 1536 x 2 B] for ~-1.7 ms / step (no q dequant). Off: the weight is
+# built per call (q by K1 as today, k / v copied from I3's cache), no static memory.
+USE_MERGED_QKV = True
+MERGED_QKV_CACHE = False
+MERGED_QKV_CACHE_MIB = 192
+
 
 def apply():
     """Install the patches; with USE_PRECOMPILE_OVERLAP, then start the background compile."""
@@ -278,6 +297,13 @@ def _apply_patches():
     lora_recompute.USE_LORA_INPUT_RECOMPUTE = False
     if USE_LORA_INPUT_RECOMPUTE and USE_UNPAD and USE_ADDNORM:
         lora_recompute.USE_LORA_INPUT_RECOMPUTE = lora_recompute.patch_lora_input_recompute()
+    # v11 Q: no class patch; unpad's packed layer calls merged_qkv.attention_forward while the flag
+    # is on. install() only captures the genuine classes (no CUDA work); needs M2's LoRA half.
+    merged_qkv.USE_MERGED_QKV = False
+    merged_qkv.MERGED_QKV_CACHE = bool(MERGED_QKV_CACHE)
+    merged_qkv.MERGED_CACHE_MIB = int(MERGED_QKV_CACHE_MIB)
+    if USE_MERGED_QKV and USE_UNPAD and lora_recompute.USE_LORA_INPUT_RECOMPUTE:
+        merged_qkv.USE_MERGED_QKV = bool(merged_qkv.install())
     if USE_HEAD_CE:                # K2
         head_loss.STORE_HEAD_FP16 = STORE_HEAD_FP16
         patch_head_loss()

@@ -459,6 +459,25 @@ def _row_scope(mask, idx, batch, seq):
     return a1.row_compact_scope(mask, idx, batch, seq)
 
 
+def _merged_attention(attn, x_bt, mask, pos_ids, use_cache, pos_emb, kwargs):
+    """v11 Q: solution/merged_qkv.py attention_forward (the attention output, o_proj included)
+    when its flag is on and the module may be called without Module.__call__ (no hooks but
+    transformers' idle capture hooks, as for the bypassed decoder layers: the collector is {} on
+    this path, output_capturing.py:105-110), else None. A None means nothing ran."""
+    q = _REFS.get("merged_qkv")
+    if q is None or not q.USE_MERGED_QKV:
+        return None
+    try:
+        ok = _bypassed_layer_ok(attn)
+    except Exception:  # noqa: BLE001 - a read-only guard
+        ok = False
+    if not ok:
+        return None
+    attn_kwargs = dict(kwargs)
+    attn_kwargs.update(position_ids=pos_ids, use_cache=use_cache)  # the call's other kwargs
+    return q.attention_forward(attn, x_bt, mask, pos_emb, attn_kwargs)
+
+
 def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3,
                   s4_off=False):
     """One decoder layer, modeling_qwen2.py:279-298, with the token-wise ops on [N, C].
@@ -474,15 +493,20 @@ def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, 
     # rebuild it from r in backward (entered second, so its lora_A hooks are the innermost).
     with _attention_scope(idx, batch, seq, x_bt.shape[-1]), \
             _lora_source_scope(layer.input_layernorm, r, x_bt, idx):
-        a_bt, _ = layer.self_attn(  # lines 282-290: the same arguments and kwargs, base shapes
-            hidden_states=x_bt,
-            attention_mask=mask,
-            position_ids=pos_ids,
-            past_key_values=None,
-            use_cache=use_cache,
-            position_embeddings=pos_emb,
-            **kwargs,
-        )
+        # v11 Q (solution/merged_qkv.py): q/k/v base projections as one GEMM when its guards
+        # pass (inside both scopes: it needs M2's source); None means nothing ran.
+        a_bt = _merged_attention(layer.self_attn, x_bt, mask, pos_ids, use_cache, pos_emb,
+                                 kwargs)
+        if a_bt is None:
+            a_bt, _ = layer.self_attn(  # lines 282-290: same arguments and kwargs, base shapes
+                hidden_states=x_bt,
+                attention_mask=mask,
+                position_ids=pos_ids,
+                past_key_values=None,
+                use_cache=use_cache,
+                position_embeddings=pos_emb,
+                **kwargs,
+            )
     del x_bt
     a = pack_rows(a_bt, idx)
     del a_bt
@@ -614,7 +638,8 @@ def patch_qwen2_model_unpad():
                                                             "Qwen2DecoderLayer.forward") else None))
     # v6 helpers (pure Python, no CUDA at import); missing ones just keep v5's ops.
     for key, name in (("fused_block", "fused_block"), ("saved_compact", "saved_compact"),
-                      ("sdpa_recompute", "sdpa_recompute"), ("lora_recompute", "lora_recompute")):
+                      ("sdpa_recompute", "sdpa_recompute"), ("lora_recompute", "lora_recompute"),
+                      ("merged_qkv", "merged_qkv")):  # v11 Q
         try:
             refs[key] = importlib.import_module(f"{__package__}.{name}")
         except Exception:  # noqa: BLE001
