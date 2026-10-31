@@ -5,8 +5,8 @@
   - Code v11 = commit `f218f86`, branch `v11-candidate`. The final commit changes only documentation: README.md, this file, VERSIONS.md (every version's branch), and comments and docstrings in solution/.
   - Lineage: v9b `91d70d3` + P2 = v10b `69b0c95`; + `STORE_HEAD_FP16 = True` = v10c `0b9e562`; + compile overlap = v10d `6b56d31`; + Q, the merged q, k, v GEMM = v11 `f218f86`.
 - Public Kaggle notebook, saved version with `COMMIT` = the final commit, also linked in README.md: https://www.kaggle.com/code/jamildeltacaptain/notebook0289d149f3
-- Demo video, up to 3 minutes: [?: link]
-- Presentation: [?: link]
+- Demo video, up to 3 minutes: uploaded with this submission on the platform (demo_v26.mp4, 2:50, 1280x720)
+- Presentation: https://claude.ai/artifact/QXw73P15EFZ5USjbKyUoik (11 slides, public link); PDF uploaded with this submission
 
 ## Team (up to 4 people)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
