@@ -4,13 +4,13 @@ K4 (`solution/mlp.py`) runs the MLP on fp16 activations; autograd then keeps the
 outputs for the SwiGLU backward: 2 x [tokens, 8960] fp16 = 70 MiB per layer at 2048 tokens.
 Nothing else in the MLP saves activations: bitsandbytes' MatMul4Bit keeps only the packed weight
 (`bitsandbytes/autograd/_functions.py:358`, `ctx.tensors = (None, B)`), and so does K1's
-`SoupNF4Matmul` (`solution/kernels/nf4.py:224`).
+`SoupNF4Matmul.forward` (`solution/kernels/nf4.py`, `ctx.save_for_backward(packed)`).
 
 `SoupMLPRecompute` wraps the whole MLP in one autograd node that saves only x16 (6 MiB per layer at
 2048 tokens) and, in backward, replays the ops autograd would have run for K4:
 
   1. dh   = grad_out @ dequant(W_down)                 (MatMul4Bit.backward, `_functions.py:384`;
-                                                        K1's backward, `nf4.py:233-236`)
+                                                        K1's `SoupNF4Matmul.backward`)
   2. g, u = gate_proj(x16), up_proj(x16)              (the same Linear4bit calls as the forward)
   3. dg, du = K4's SwiGLU backward(dh, g, u)           (v8 C2: `kernels/swiglu.py`; flag off: the
                                                         example's, `swiglu.py:53-61`, called)
@@ -21,12 +21,12 @@ Why the recompute gives the forward's bits: inside Function.forward and backward
 so bitsandbytes' matmul_4bit takes its no-grad branch (`_functions.py:453-489`), which calls the
 same `gemm_4bit.default` op with the same arguments as `MatMul4Bit.forward` (`:323-345`); B is
 normalised to `view(-1, 1)` before either branch (`:431`), and the CUDA dispatch picks its kernel
-from M, N, K only (`backends/cuda/ops.py:935-985`). K1's `soup_matmul_4bit` (`nf4.py:259-299`)
+from M, N, K only (`backends/cuda/ops.py:935-985`). K1's `soup_matmul_4bit` (`kernels/nf4.py`)
 does not look at grad mode either. So with the default settings outputs and input gradients are
 bit-identical to K4 (the tests check `torch.equal`).
 
 The pass is guarded: unless USE_MLP_RECOMPUTE is on, grad is being recorded, x requires grad,
-K4's own guard passes (`mlp.py:25-43`: CUDA input, exact bnb Linear4bit with fp16 compute dtype,
+K4's guard passes (`mlp._fp16_path_ok`: CUDA input, exact bnb Linear4bit with fp16 compute dtype,
 config.hidden_act == "silu"), autocast is off or fp16, no global module hooks exist, and every
 projection has no bias, a frozen Params4bit nf4 weight on x's device and no module hooks, the call
 goes to K4 (which itself falls back to the original Qwen2MLP.forward). A guard that rejects a
@@ -38,7 +38,7 @@ forward's SwiGLU run our soup_swiglu_kernel (solution/kernels/swiglu.py: forward
 same in-place backward) instead of the example's kernels. Same values; the example code below stays
 as the flag-off path.
 
-v9 M5 (BWD_ROW_CHUNKS > 1, set by apply() from USE_BWD_CHUNKING): on the "both" path the backward
+v9 M5 (BWD_ROW_CHUNKS > 1 from USE_BWD_CHUNKING, off since v9b): on the "both" path the backward
 keeps one dense weight at a time and recomputes u in row chunks (_gate_up_input_grad_rows). Per
 MLP backward at N rows (U = N x 8960 fp16, W = one dense [8960, 1536] fp16 weight, 26.25 MiB):
 "both" holds dh, g, u, W_gate, W_up = 3U + 2W at the recompute of u; "rows" holds dh, g, W_up and
@@ -59,18 +59,18 @@ import torch.nn.functional as F
 
 from . import mlp as _k4
 
-# Off by default; apply() flips it after a Kaggle run confirms the trade (PLAN.md F10).
+# Module default off (tests import this module alone); solution.apply() sets it (on since v5f).
 USE_MLP_RECOMPUTE = False
 # True: recompute gate and up (saves 64 MiB per layer at 2048 tokens).
 # False: keep the fp16 gate output, recompute only up (saves 29 MiB per layer, half the extra GEMMs).
 RECOMPUTE_GATE = True
-# "example": the SwiGLU backward kernel K4 uses (bit-exact with K4): ours with v8 C2's
-# USE_SOUP_SWIGLU on, else the starter kit's. "torch": plain torch fp32 math.
+# "example" (a historical value name): the SwiGLU backward kernel K4 uses (bit-exact with K4),
+# ours with v8 C2's USE_SOUP_SWIGLU on (as submitted), else the starter kit's. "torch": fp32 math.
 SWIGLU_BACKWARD = "example"
-# v6: launch the example's SwiGLU backward kernel with its outputs written over its own inputs
-# (dgate over grad, dup over gate) when gate was recomputed here. Same kernel, same arguments
-# otherwise, so the same compiled variant and the same bits; two [tokens, 8960] fp16 buffers fewer
-# at the moment of the MLP backward (see _swiglu_backward_inplace).
+# C (v6): K4's SwiGLU backward kernel (ours with C2, the example's without) writes its outputs
+# over its own inputs (dgate over grad, dup over gate) when gate was recomputed here. Same kernel,
+# same arguments otherwise, so the same compiled variant and the same bits; two [tokens, 8960]
+# fp16 buffers fewer at the moment of the MLP backward (see _swiglu_backward_inplace).
 INPLACE_SWIGLU_BACKWARD = True
 # v7 I2: dense gate/up weights in the backward. "off" (v6.1): gate_proj(x16) and up_proj(x16)
 # dequantize W_gate and W_up inside K1's SoupNF4Matmul.forward, then step 4 dequantizes both
@@ -96,7 +96,7 @@ _PATCH_MARK = "_soup_delta_mlp_recompute"
 _PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")
 _LAYER_HOOKS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
 # torch.nn.modules.module keeps the register_module_*_hook registries in these dicts. They are
-# private names (torch source is not on disk here); a missing name simply reads as "no hooks".
+# private names, read with getattr; a missing name simply reads as "no hooks".
 _GLOBAL_HOOKS = ("_global_forward_hooks", "_global_forward_pre_hooks",
                  "_global_backward_hooks", "_global_backward_pre_hooks")
 _NF4_MODULE = f"{__package__}.kernels.nf4"
@@ -233,8 +233,8 @@ def _reuse_nf4(mode, x16, gate_proj, up_proj, g_saved):
         from bitsandbytes.nn import Linear4bit
 
         for proj in ((gate_proj, up_proj) if mode == "both" else (up_proj,)):
-            # K4's guard already demands exactly this (mlp.py:38-42) and _reject_reason a missing
-            # bias and no hooks (:323-337); rechecked here because the fused block reaches this
+            # K4's guard already demands exactly this (mlp._fp16_path_ok) and _reject_reason a
+            # missing bias and no hooks; rechecked here because the fused block reaches this
             # helper from its own backward. An instance-level forward (e.g. an accelerate hook)
             # would be bypassed, so it keeps the layer call.
             if type(proj) is not Linear4bit or "forward" in proj.__dict__:
@@ -335,9 +335,9 @@ def _gate_up_input_grad_rows(nf4, dh_box, x16, gate_proj, up_proj, bounds):
     So "rows" is NOT bit-identical to "both" in general: Kaggle T4 (31.10) gave equal bits at
     N = 600, 1350, 1351, 1400, 2000, 2048 but not at N = 513 (chunks 384 + 129 and 256 + 257).
     The difference is ulp-level in u, hence in dgate (dup does not read u) and dx; checks 5/6 use
-    tolerances. tests/test_bwd_chunking.py checks "rows" bit for bit against "both"'s operations
-    with u from the same per-chunk GEMMs (the chunk indexing), and against "both" itself within
-    the S4 input-gradient bound.
+    tolerances. solution/tests/test_bwd_chunking.py checks "rows" bit for bit against "both"'s
+    operations with u from the same per-chunk GEMMs (the chunk indexing), and against "both"
+    itself within the S4 input-gradient bound.
     """
     dh = dh_box.pop()
     x2 = x16.view(-1, x16.shape[-1])
@@ -463,7 +463,7 @@ def _dequantize_weight(layer, dtype):
     With K1 installed, K1's kernel is used: it returns the same fp16 bits as bnb's dequantize_4bit
     (K1's tests and the Kaggle micro-benchmark check torch.equal) and keeps the dequant work in
     our kernel (check 4). K1 refuses non-nf4 / non-nested / non-fp16 states with TypeError or
-    ValueError (`nf4.py:104-175`); bitsandbytes handles those.
+    ValueError (`nf4._validate_inputs`); bitsandbytes handles those.
 
     v7 I2 (S4_DEQUANT_REUSE != "off"): K1 gets the Params4bit itself, as K1's forward does. K1
     reads only its storage (same pointer, numel, contiguity: the same bits), but its validation
@@ -625,7 +625,7 @@ def patch_qwen2_mlp_recompute():
         if USE_MLP_RECOMPUTE:
             reason = _reject_reason(self, x)
             if reason is None:
-                # Same dtype contract as K4 (`mlp.py:60-63`).
+                # Same dtype contract as K4 (mlp.patch_qwen2_mlp_fp16's forward).
                 x16 = x if x.dtype == torch.float16 else x.to(torch.float16)
                 out = SoupMLPRecompute.apply(
                     x16, self.gate_proj, self.up_proj, self.down_proj, bool(RECOMPUTE_GATE)

@@ -3,7 +3,7 @@
 With USE_SOUP_SWIGLU on (solution/__init__.py -> solution/mlp.py), K4 (solution/mlp.py) and S4
 (solution/mlp_recompute.py) call this module instead of the starter kit's example
 (solution/swiglu.py). The example stays in the repository as the reference and the flag-off path;
-with the flag on it is never launched (tests/test_soup_swiglu.py counts launches by name).
+with the flag on it is never launched (solution/tests/test_soup_swiglu.py counts launches by name).
 
 One @triton.jit, `soup_swiglu_kernel`, with a runtime `mode` in do_not_specialize: 0 is the
 forward, 1 the backward. Training compiles one variant of one kernel where v7 compiled the
@@ -18,7 +18,7 @@ then one cast to the output pointer's element type with Triton's default roundin
 the cast the example writes as `.to(ptr.dtype.element_ty)`. tl.sigmoid is the same library
 function and the compile options are the defaults, as for the example, so `1 + g * (1 - s)` gets
 the same FMA treatment. The work is element-wise (no reduction), so the tile layout cannot change a
-value. tests/test_soup_swiglu.py checks torch.equal against the example kernels.
+value. solution/tests/test_soup_swiglu.py checks torch.equal against the example kernels.
 
 Layout. One program covers _TILE = 1024 consecutive elements (the example's BLOCK) at 4 warps, with
 int64 element offsets. `n` stays specialised, as the example's n_elements: in training it is

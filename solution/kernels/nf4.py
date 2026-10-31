@@ -1,4 +1,4 @@
-"""NF4 dequantization (K1 v3s) and a guarded bitsandbytes matmul replacement.
+"""NF4 dequantization (K1) and a guarded bitsandbytes matmul replacement.
 
 Importing this module performs no CUDA queries or allocations.
 
@@ -23,9 +23,9 @@ Idea credit: the tile (one absmax per thread, one packed byte -> two outputs,
 1-2K outputs per CTA) follows bitsandbytes kDequantizeBlockwise
 (csrc/kernels.cu:465-528, launch csrc/ops.cu:78-95). The code is our own.
 
-Measured on a Kaggle T4 (results/measurements.md, 30.10, median of 7 x 200
+Measured on a Kaggle T4 (our micro-benchmark, 30.10, median of 7 x 200
 calls): 0.166 / 0.030 / 0.029 ms on [8960,1536] / [1536,1536] / [256,1536],
-bit-exact with bitsandbytes.functional.dequantize_4bit; K1 v1 was 0.289 /
+bit-exact with bitsandbytes.functional.dequantize_4bit; our first K1 was 0.289 /
 0.050 / 0.051, bnb's full dequantize_4bit 0.300 / 0.083 / 0.081.
 """
 
@@ -76,10 +76,10 @@ _ORIGINAL_BNB_MATMUL_4BIT = None
 # v6.1 behaviour, so tests that import this module alone see v6.1 unless they set them.
 # USE_K1_FAST_HOST: (1) a validation-cache hit also accepts an alias of the validated packed
 #   tensor (same storage start, byte count, dtype, contiguity and device), which D's saved-tensor
-#   hooks (saved_compact.py:126, :197 `t.detach()`) and S4's `weight.view(-1, 1)`
-#   (mlp_recompute.py:226) produce on every call; a miss no longer evicts a live entry for such a
-#   short-lived alias. (2) _launch skips `torch.cuda.device(...)` when the weight is on the current
-#   device (that context only swaps the current device; it creates no stream).
+#   hooks (saved_compact.py:126, :197 `t.detach()`) and S4's `weight.view(-1, 1)` (in
+#   mlp_recompute._dequantize_weight) produce on every call; a miss no longer evicts a live entry
+#   for such a short-lived alias. (2) _launch skips `torch.cuda.device(...)` when the weight is on
+#   the current device (that context only swaps the current device; it creates no stream).
 # USE_DENSE_CACHE: the fp16 result of the shapes in _DENSE_SHAPES (k_proj / v_proj, [256, 1536],
 #   0.75 MiB each) is kept for the whole run, up to DENSE_CACHE_MIB, and returned again for the same
 #   validated weight. DENSE_CACHE_QO adds q_proj / o_proj ([1536, 1536], +252 MiB on 1.5B).
@@ -352,8 +352,8 @@ def _checked_entry(packed, quant_state):
                 if packed.data_ptr() == ptr:  # v6.1 hit
                     return nk, entry
             elif USE_K1_FAST_HOST and _is_alias(packed, ptr, numel, dev):
-                # D's detach() alias (saved_compact.py:126, :197) or S4's view(-1, 1)
-                # (mlp_recompute.py:226) of the validated weight: same bytes, same answer.
+                # D's detach() alias (saved_compact.py:126, :197) or S4's view(-1, 1) (in
+                # mlp_recompute._dequantize_weight) of the checked weight: same bytes, same answer.
                 # Exception: a Parameter (the Params4bit) whose record is owned by a dead alias
                 # takes the record over once below, so the dense cache (live owner) can hit.
                 if packed_ref() is not None or not isinstance(packed, torch.nn.Parameter):
@@ -465,7 +465,7 @@ def _launch(packed, quant_state, count, out):
     # The caller must provide output storage disjoint from the input metadata.
     # I3: torch.cuda.device only swaps the current device (no stream), so when the weight is
     # already on the current device the launch is the same without it. The metadata tensor is
-    # asked instead of packed: _validate_inputs put both on one device (:217-224), and absmax is a
+    # asked instead of packed: _validate_inputs put both on one device, and absmax is a
     # plain tensor, while a Params4bit routes every method through its __torch_function__
     # (bitsandbytes/nn/modules.py:446-484).
     if USE_K1_FAST_HOST and quant_state.absmax.get_device() == torch.cuda.current_device():
@@ -624,7 +624,7 @@ _BNB_CUSTOM_MAX_M = 1536
 
 # bitsandbytes.backends.cuda.ops, imported on first use (never at our import).
 # The module is cached, not the function: _gemm_4bit_use_custom_fn is read as
-# an attribute on every call, so a monkeypatched heuristic (tests/test_nf4.py)
+# an attribute on every call, so a monkeypatched heuristic (solution/tests/test_nf4.py)
 # is still seen. bnb caches the decision itself (ops.py:583-584,
 # functools.cache), so what this saves is the per-call `from ... import`.
 _BNB_CUDA_OPS = None

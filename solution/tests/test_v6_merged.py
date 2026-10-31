@@ -9,6 +9,7 @@ every v6 piece fired the expected number of times, D packed only the two LoRA-A 
 (A1's 4-D saves and A2's absent masks are not touched), and autograd holds at least 80 % of the
 expected saving after the forward.
 
+Named after the version that introduced these tests; they run against the current code.
 CUDA only (Kaggle T4). Run from the repository root: python -m pytest solution -q
 """
 
@@ -270,12 +271,12 @@ def test_s4_off_count(monkeypatch):
 def test_apply_forwards_s4_off_fraction(recorder, monkeypatch):  # noqa: F811
     monkeypatch.setattr(unpad, "S4_OFF_FRACTION", unpad.S4_OFF_FRACTION)
     monkeypatch.setattr(solution, "S4_OFF_FRACTION", solution.S4_OFF_FRACTION)
-    # v8 F1: the default is 0.0 (S4 on every packed layer, as v6.1); the I4 path stays and is
+    # v8: the default is 0.0 (S4 on every packed layer, as v6.1); the I4 path stays and is
     # driven by explicit fractions here and in the tests around this one.
     assert solution.S4_OFF_FRACTION == 0.0
     solution.apply()
     assert unpad.S4_OFF_FRACTION == 0.0
-    for frac in (0.25, 0.072):  # v7's value; ADR-002's 2-of-28-layers setting
+    for frac in (0.25, 0.072):  # v7's value; a 2-of-28-layers setting
         monkeypatch.setattr(solution, "S4_OFF_FRACTION", frac)
         solution.apply()
         assert unpad.S4_OFF_FRACTION == frac
@@ -298,8 +299,8 @@ def _requested_bytes():
     memory_allocated() counts whole blocks: a large-pool request (> 1 MiB) served from a cached
     free block is not split when the remainder is <= 1 MiB, so a tensor may count up to 1 MiB
     more than its size, depending on what earlier runs left in the cache. "requested_bytes"
-    counts the requested sizes only. [From memory, torch source is not on disk: c10/cuda/
-    CUDACachingAllocator.cpp should_split (kSmallSize = 1 MiB) and the allocated_bytes /
+    counts the requested sizes only. [Our reading of c10/cuda/CUDACachingAllocator.cpp, not
+    checked against the source: should_split (kSmallSize = 1 MiB) and the allocated_bytes /
     requested_bytes stats; torch.cuda.memory_stats documents requested_bytes.*.current.]"""
     try:
         value = torch.cuda.memory_stats().get("requested_bytes.all.current")
@@ -425,11 +426,11 @@ def test_s4_off_first_layers_bit_exact_and_holds_gate_up(v6_patches, monkeypatch
         assert new["scale"] == ref_a["scale"]
 
         # Held bytes. The prediction is the whole I4 code path: _mlp_no_recompute (unpad.py)
-        # calls K4's forward (mlp.py:60-63), which keeps fp16 gate and up through the example
+        # calls K4's forward (mlp.py), which keeps fp16 gate and up through the example
         # SwiGLU's save_for_backward (swiglu.py:50) and nothing else (bnb's MatMul4Bit keeps only
         # the packed weight, bitsandbytes/autograd/_functions.py:357-360, reached at :491; K4's
-        # casts are ToCopy nodes); K3's add_rmsnorm keeps r_mid and rstd (kernels/addnorm.py:167)
-        # where B kept r, a and rstd (fused_block.py:80). The T4 run of 30.10 measured
+        # casts are ToCopy nodes); K3's add_rmsnorm keeps r_mid and rstd (addnorm._AddRMSNorm)
+        # where B kept r, a and rstd (fused_block.SoupAddNormMLP). The T4 run of 30.10 measured
         # 10 006 528 B against 8 126 464 at 0.34: the 1 880 064 B gap is not a multiple of the
         # N = 248 real rows (nor of B*T = 600), so no per-token tensor of the model; it is the
         # caching allocator's unsplit block remainder (see _requested_bytes), which differs

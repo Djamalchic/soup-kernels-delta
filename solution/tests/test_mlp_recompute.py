@@ -92,7 +92,7 @@ def run(mlp, x, grad, monkeypatch, s4, autocast=False):
 
 
 # [N, C] is the packed shape under unpadding (U); M = 3 / 74 / 300 / 2048 covers bnb's custom
-# kernel, K1's m <= 1536 dispatch and K1's dequant + F.linear path (nf4.py:279-299).
+# kernel, K1's m <= 1536 dispatch and K1's dequant + F.linear path (nf4.py k1_dense_path).
 SHAPES = [(1, 3, HIDDEN), (2, 37, HIDDEN), (300, HIDDEN), (4, 512, HIDDEN)]
 
 
@@ -391,7 +391,7 @@ _PROJS = ("gate_proj", "up_proj", "down_proj")
 
 def _fp16_linear4bit(n_in, n_out):
     """Linear4bit quantized from an fp16 weight, so quant_state.dtype is fp16 and K1 takes it
-    (as tests/test_peak_v6.py fp16_linear4bit; the real run loads the model in fp16)."""
+    (as test_peak_v6.py fp16_linear4bit; the real run loads the model in fp16)."""
     lin = bnb.nn.Linear4bit(n_in, n_out, bias=False, compute_dtype=torch.float16,
                             compress_statistics=True, quant_type="nf4")
     lin.weight.data = lin.weight.data.to(torch.float16)

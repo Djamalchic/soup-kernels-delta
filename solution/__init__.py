@@ -6,6 +6,14 @@ setting. It never creates the CUDA context; with v10d (USE_PRECOMPILE_OVERLAP, b
 the harness already created, its last step starts one background thread that compiles our five
 kernels while Soup loads the model, joined before the first forward (solution/precompile.py).
 
+Submitted configuration (v11, the flag values below). On: K1, K2 with the fp16 head, K3, K4, U,
+S4 with C (in-place SwiGLU backward) and I2, B, A1 with I1 and M3, A2, D, I3 (k/v dense cache),
+C1, C2, M2, P2 (all three sub-flags), the compile overlap and Q (merged q/k/v GEMM, weight built
+per call). Off, with the code kept and covered by solution/tests: A (A1's fallback), I4
+(S4_OFF_FRACTION = 0.0), M5 (USE_BWD_CHUNKING), the q/o dense cache (DENSE_CACHE_QO), Q's kept
+weight (MERGED_QKV_CACHE) and every flag-off path the comments below name. VERSIONS.md in the
+repository root maps each component name to its file and version.
+
 - K1, `solution/kernels/nf4.py`: our NF4 dequantization kernel replaces bitsandbytes' dequant on
   its dequant+linear path, in the forward pass and in the backward re-dequant (bit-exact).
 - K4, `solution/mlp.py`: the Qwen2 MLP runs on fp16 activations (bitsandbytes computes in fp16
@@ -43,13 +51,13 @@ A1's SDPA backward, which is only as deterministic as torch's):
   (A1 first; A is not even patched while A1 is wanted, and A refuses a non-genuine "sdpa").
 - I1 (v7), `solution/sdpa_recompute.py` USE_CAUSAL_PADDED + `solution/unpad.py` _causal_scope: on
   U's packed path A1 runs SDPA as is_causal=True without the bool mask (block skipping, no bias).
-- K2 part 3, `solution/head_loss.py` STORE_HEAD_FP16 (off): lossless fp16 storage of the frozen
-  tied embedding / lm_head after an element-by-element check on the device.
+- fp16 head (K2 part 3, on since v10c), `solution/head_loss.py` STORE_HEAD_FP16: lossless fp16
+  storage of the frozen tied embedding / lm_head after an element-by-element check on the device.
 
 v7 I4, `solution/unpad.py` S4_OFF_FRACTION (flag below): the first int(layers * fraction) packed
 layers skip B and S4 (K3 add_rmsnorm + K4 MLP keep gate/up), trading ~38 KiB per real token per
 layer of the memory headroom for the gate/up recompute in backward. Bit-identical values. v8 sets
-the fraction to 0.0 (every packed layer keeps S4, as v6.1); the path stays for tuning.
+the fraction to 0.0 (every packed layer keeps S4, as v6.1); the path stays and is tested.
 v7 I2, `solution/mlp_recompute.py` S4_DEQUANT_REUSE: S4's backward dequantizes W_gate / W_up once
 each and reuses them for the recompute and dx (was twice). Bit-identical values.
 v7 I3, `solution/kernels/nf4.py` USE_K1_FAST_HOST / USE_DENSE_CACHE: K1's validation cache accepts
@@ -71,12 +79,13 @@ below): A1 keeps q16 / k16 / v16 of the real rows only and scatters them back in
 backward recompute. Same gradients (pad query rows have dO = 0, pad keys are masked).
 The example's own class patch (`solution/swiglu.py: patch_qwen2_mlp`) stays off; with
 USE_SOUP_SWIGLU off, K4 and S4 call the example kernels directly (v7).
-v9 M5, USE_BWD_CHUNKING (flag below): the step's peak is the layer-27 MLP backward (S4 / B "both":
-dh, g, u, W_gate, W_up alive). `solution/mlp_recompute.py` _gate_up_input_grad_rows keeps one
-dense weight at a time and recomputes u in BWD_ROW_CHUNKS row chunks (3U + 2W -> 2U + W + U/k),
-and `solution/kernels/head_ce.py` VOCAB_TILE goes 16384 -> K2_VOCAB_TILE so K2's tiles stay under
-the new peak. Forward values unchanged; the S4 input gradient is bit-identical to "both" when
-cuBLAS's u GEMM gives the same rows for M = chunk as for M = N (tests/test_bwd_chunking.py checks
+v9 M5, USE_BWD_CHUNKING (flag below; off since v9b, the path is kept and tested): the step's peak
+is the layer-27 MLP backward (S4 / B "both": dh, g, u, W_gate, W_up alive).
+`solution/mlp_recompute.py` _gate_up_input_grad_rows keeps one dense weight at a time and
+recomputes u in BWD_ROW_CHUNKS row chunks (3U + 2W -> 2U + W + U/k), and
+`solution/kernels/head_ce.py` VOCAB_TILE goes 16384 -> K2_VOCAB_TILE so K2's tiles stay under the
+new peak. Forward values unchanged; the S4 input gradient is bit-identical to "both" when cuBLAS's
+u GEMM gives the same rows for M = chunk as for M = N (solution/tests/test_bwd_chunking.py checks
 it on the T4); K2's hidden gradient sums 19 tile partials instead of 10 (equal within K2's tests).
 v10 P2 (USE_ELEMENTWISE_FUSION, flags below): element-wise casts / copies / adds of our own paths
 run inside launches we already make: B's four fp32 <-> fp16 casts inside K3 (`solution/kernels/
@@ -88,10 +97,16 @@ precompile.py`: at the end of apply() one thread compiles the five kernels the r
 (JITFunction.warmup with their production argument kinds: same cache keys, same binaries, same
 values) while Soup builds the model; the first Qwen2ForCausalLM.forward, and every launch helper of
 ours, joins it first. The compile time stays inside the measured run, with the same empty cache.
+v11 Q (USE_MERGED_QKV, flags below), `solution/merged_qkv.py`: on U's packed path q_proj / k_proj /
+v_proj base projections run as ONE fp16 GEMM against [W_q; W_k; W_v] ([2048, 1536], rows from K1's
+bit-exact dequant), split into q / k / v inside one autograd node whose backward is ONE dX GEMM;
+the q / v LoRA halves are M2's code unchanged (same dropout draws, same order). Not bit-identical:
+cuBLAS's N = 2048 kernel may round an output element to the neighbouring fp16 value, and dX is
+summed in fp32 inside the GEMM and rounded once (solution/tests/test_merged_qkv.py tolerances).
 """
 
-from . import fused_block, head_loss, lora_recompute, lora_replay, mlp, mlp_recompute, precompile
-from . import saved_compact, sdpa_recompute, unpad
+from . import fused_block, head_loss, lora_recompute, lora_replay, merged_qkv, mlp, mlp_recompute
+from . import precompile, saved_compact, sdpa_recompute, unpad
 from .head_loss import patch_head_loss
 from .kernels.nf4 import patch_bnb_matmul_4bit
 from .layers import patch_qwen2_decoder_layer, patch_qwen2_rmsnorm
@@ -118,14 +133,14 @@ USE_LORA_DROPOUT_REPLAY = True  # v6 A2
 USE_LORA_ROW_COMPACT = True  # v6 D (needs U)
 # v6 A: fallback for A1 only. Taken only when USE_SDPA_RECOMPUTE is False (see the docstring).
 USE_SDPA_KV_COMPACT = False
-# K2 part 3: -445 MiB static. Off: "do not change the model" is an open rule question (PLAN Q2).
-STORE_HEAD_FP16 = True  # fp16 copy of the tied embedding/lm_head, exact (every value checked on the device); team decision 31.10
+# fp16 head (K2 part 3, v10c): -445 MiB static. Every value is checked fp16-exact on the device
+# first; the organisers confirmed on 31.10 that this lossless storage repacking is allowed (README).
+STORE_HEAD_FP16 = True  # exact fp16 copy of the tied embedding / lm_head
 # v7 I4 (needs U): the first int(num_hidden_layers * fraction) packed layers run K3 + K4 without
-# S4's recompute (28 layers -> 7; 2-3-layer test models -> 0). Same values, ~+343 MiB at the peak
-# batch [estimate], less backward work. Kaggle tuning: peak > 3 280 MiB -> 0.215 (6 layers),
-# peak < 3 150 MiB -> 0.29 (8 layers). 0.0 is exactly v6.1.
-# v8 F1: 0.0. The Kaggle scouting run measured the same speed at 0.0 as at v7's 0.25 and a
-# 2 893 MiB peak instead of 3 233 (ADR-002 cap: <= 3 000 MiB).
+# S4's recompute (v7's 0.25: 28 layers -> 7; 2-3-layer test models -> 0). Same values, ~+343 MiB
+# at the peak batch [estimate], less backward work. 0.0 is exactly v6.1.
+# v8: 0.0. A Kaggle scouting run measured the same speed at 0.0 as at v7's 0.25 and a 2 893 MiB
+# peak instead of 3 233. The path stays for the tests.
 S4_OFF_FRACTION = 0.0
 
 # v7 I3 (solution/kernels/nf4.py). FAST_HOST: K1's validation cache also hits for D's / S4's
@@ -150,7 +165,9 @@ USE_SOUP_SWIGLU = True
 # tiles 90 -> 45 MiB, backward 102 -> 57 MiB; the step's peak drops ~43 MiB (next limit: the
 # layer-27 MLP forward, ~6 MiB below). Cost ~+0.3-0.5 s per run: one more W_gate dequant per
 # chunked MLP backward, the u GEMM in pieces, 9 more K2 tiles. False = v8b exactly.
-USE_BWD_CHUNKING = False  # M5 measured ~-30 MiB for ~+0.5 s: not worth it, and the only non-bit-exact change in v9
+# Off since v9b: full runs gave a 40 MiB lower peak with M5 (2 475 MiB in v9 against 2 515 in v9b,
+# different sessions) for ~+0.5 s [estimate], and M5 is the only change of v9 that is not bit-exact.
+USE_BWD_CHUNKING = False
 BWD_ROW_CHUNKS = 4         # u recompute pieces (384-row chunks at N = 1350)
 BWD_CHUNK_MIN_ROWS = 512   # smaller batches keep "both" (not the peak; saves the extra dequant)
 K2_VOCAB_TILE = 8192
@@ -175,9 +192,9 @@ USE_LORA_INPUT_RECOMPUTE = True
 #   LoRA scaling is fp16-exact (task: 2.0).
 # - EW_LORA_NO_CLONE (M2): peft's defensive clone of the base output is skipped (identity before
 #   an out-of-place add): -56 launches / ~-5 ms GPU per step; covered by the epilogue when it runs.
-# Same bits by construction (the same IEEE ops); tests/test_ew_fusion.py checks them on the T4,
-# including whether the v10 K3 entries keep v9b's rstd summation order (else: fp32 ulps vs v9b,
-# consistent inside the run).
+# Same bits by construction (the same IEEE ops); solution/tests/test_ew_fusion.py checks them on
+# the T4, including whether the v10 K3 entries keep v9b's rstd summation order (else: fp32 ulps
+# vs v9b, consistent inside the run).
 USE_ELEMENTWISE_FUSION = True
 EW_K3_FP16 = True
 EW_LORA_EPILOGUE = True
@@ -192,8 +209,24 @@ EW_LORA_NO_CLONE = True
 # the CUDA context already exists (harness/_train.py:120) and Triton is real. Each warmup adds 1 to
 # the harness's triton_launches (never timed). v10 P1 did the same compiles inside apply() (Kaggle
 # T4: step_s[0] -2.68 s, apply_s +2.74 s, wall +-0); the gain here is only the part that overlaps
-# Soup's model loading [estimate -1...-2.5 s of wall]. False = v10c.
+# Soup's model loading: -2.1 s of wall on the means in one ABBA session, step 1 4.0 -> 1.1 s
+# (notebook version 21, README part 3). False = v10c.
 USE_PRECOMPILE_OVERLAP = True
+
+# v11 Q (solution/merged_qkv.py; needs U, K1 and M2, which supplies the LoRA halves): q/k/v base
+# projections as one GEMM per layer and one dX GEMM in backward; one x -> fp16 cast instead of
+# three; x's gradient sums 3 contributions instead of 5. Per step at P = 2048 [estimate]: ~-4 ms
+# forward (two casts, the N = 256 GEMMs' poor T4 fill) and ~-11 ms backward (two fp16 -> fp32
+# casts and two fp32 adds of [P, 1536], one GEMM instead of three), minus ~2 ms for the q / v
+# copies and the gradient concat. Measured: -0.55 s of wall on the means in one ABBA session, peak
+# unchanged at 2 335 MiB (notebook version 23, README part 3). False = v10d exactly.
+# MERGED_QKV_CACHE (off as submitted, not measured): keep [W_q; W_k; W_v] for the run (I3's k / v
+# entries become views of it): +126 MiB static [28 x 1536 x 1536 x 2 B] for ~-1.7 ms / step
+# [estimate] (no q dequant). Off: the weight is built per call (q by K1 as in v10d, k / v copied
+# from I3's cache), no static memory. MERGED_QKV_CACHE_MIB caps that cache (28 x 6 MiB = 168 MiB).
+USE_MERGED_QKV = True
+MERGED_QKV_CACHE = False
+MERGED_QKV_CACHE_MIB = 192
 
 
 def apply():
@@ -278,6 +311,13 @@ def _apply_patches():
     lora_recompute.USE_LORA_INPUT_RECOMPUTE = False
     if USE_LORA_INPUT_RECOMPUTE and USE_UNPAD and USE_ADDNORM:
         lora_recompute.USE_LORA_INPUT_RECOMPUTE = lora_recompute.patch_lora_input_recompute()
+    # v11 Q: no class patch; unpad's packed layer calls merged_qkv.attention_forward while the flag
+    # is on. install() only captures the genuine classes (no CUDA work); needs M2's LoRA half.
+    merged_qkv.USE_MERGED_QKV = False
+    merged_qkv.MERGED_QKV_CACHE = bool(MERGED_QKV_CACHE)
+    merged_qkv.MERGED_CACHE_MIB = int(MERGED_QKV_CACHE_MIB)
+    if USE_MERGED_QKV and USE_UNPAD and lora_recompute.USE_LORA_INPUT_RECOMPUTE:
+        merged_qkv.USE_MERGED_QKV = bool(merged_qkv.install())
     if USE_HEAD_CE:                # K2
         head_loss.STORE_HEAD_FP16 = STORE_HEAD_FP16
         patch_head_loss()

@@ -2,6 +2,7 @@
 S4's in-place SwiGLU backward. Each must give v5's numbers (bit for bit where v5 itself is
 deterministic) while autograd keeps less.
 
+Named after the version that introduced these tests; they run against the current code.
 Run from the repository root on a T4: python -m pytest solution -q
 """
 
@@ -62,7 +63,7 @@ def _assert_matches(ref_a, ref_b, new, name=""):
 # q lora_B with ref_a == ref_b, new != ref_a); v7 failed it again the same way, and
 # test_v6_no_leak's I3 cache test on layer 0's q lora_A (-3.7050e-04 vs -3.7074e-04, forward bit
 # for bit). Suspected source: torch's memory-efficient SDPA backward (non-deterministic by
-# default; from memory, torch source is not on disk); it is in the reference path of all three.
+# default [not checked against the torch source]); it is in the reference path of all three.
 # The forward stays deterministic and is still checked bit for bit (loss, hidden, RNG).
 # Bound: the derived LoRA-gradient tolerance of the K1/K3/K4 composition (test_unpad.py, comment
 # above check_against_base: each fp16 output may round to a neighbouring value, u = 2**-11, at most
@@ -182,7 +183,7 @@ def fp16_linear4bit(n_in, n_out, bias=False):
     """bnb Linear4bit quantized from an fp16 weight, as from_pretrained(torch_dtype=fp16) leaves it:
     quantize_4bit records the input dtype in quant_state.dtype (bitsandbytes functional.py:668-677,
     Params4bit._quantize nn/modules.py:381-391, run by .cuda() via to() :424-428), and K1 only takes
-    fp16 states (solution/kernels/nf4.py:196-197). Built from the default fp32 weight, the state is
+    fp16 states (K1's _validate_inputs). Built from the default fp32 weight, the state is
     fp32, K1 refuses it and S4 falls back to bnb's fp32 dequant + .to(fp16), whose 52 MiB fp32
     weight then sets the backward peak (that is why the in-place SwiGLU test saw no difference)."""
     lin = bnb.nn.Linear4bit(n_in, n_out, bias=bias, compute_dtype=torch.float16,

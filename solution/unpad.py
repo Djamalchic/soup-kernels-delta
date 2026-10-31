@@ -1,7 +1,7 @@
 """U: run the token-wise half of every Qwen2 decoder layer on the real (unpadded) rows only.
 
 TRL's collator right-pads every batch to its longest row (trl/trainer/sft_trainer.py:182, 215-217),
-so at batch 4 roughly 40-47 % of the [B, T] positions are padding [estimate, UNPAD_DESIGN.md s.1].
+so at batch 4 roughly 40-47 % of the [B, T] positions are padding [estimate].
 RMSNorm, the residual adds and the MLP work row by row, so on the fast path they run on the N real
 rows ([N, C]). Attention keeps the exact base shapes ([B, T, C] in and out): q/k/v/o, LoRA dropout,
 RoPE, the causal+padding mask and SDPA see tensors of the base shape in the base call order, so
@@ -35,20 +35,20 @@ Qwen2Model / Qwen2DecoderLayer / Qwen2RMSNorm types; the decoder-layer forward i
 or K3's patch of it; no gradient checkpointing; SDPA; attention_dropout == 0; full attention only;
 CUDA int input_ids [B, T] on the embedding's device; a 2D bool/int attention_mask of the same shape
 that is binary, right-padded and has no empty row (checked on the device and folded into the one
-`nonzero`, idea from the GPT-6-Astra variant); no inputs_embeds / position_ids / past_key_values /
+`nonzero`, idea from a GPT-6-Astra draft); no inputs_embeds / position_ids / past_key_values /
 cache; no hooks or instance-level forward on the decoder layers we bypass except transformers' own
 idle output-capture hooks; no global module hooks; no active dropout inside the MLP (LoRA on MLP
 projections would draw RNG on N rows); N >= 129 and at least 1/32 of the rows padding. Any exception
 while guards run means the original (Soup's tests pass fake modules); nothing is retried once
 attention may have consumed RNG.
 
-v6 peak-timing additions, both bit-identical to the ops they replace and both off unless apply()
-switches them on: the attention call runs inside solution/saved_compact.py's attention_scope (A:
-SDPA keeps one head per GQA group of its repeated key/value; D: LoRA keep-masks and LoRA-A inputs
-keep only the real rows), and with K3 the add + norm + S4 MLP + residual add run as
-solution/fused_block.py's single node, which saves (r, a) instead of (r_mid, x16).
+v6 peak-timing additions, both bit-identical to the ops they replace (module defaults off; apply()
+turns D and B on, while A, A1's fallback, stays off): the attention call runs inside
+solution/saved_compact.py's attention_scope (A: SDPA keeps one head per GQA group of its repeated
+key/value; D: LoRA keep-masks and LoRA-A inputs keep only the real rows), and with K3 the add +
+norm + S4 MLP + residual add run as fused_block.py's single node, saving (r, a), not (r_mid, x16).
 
-v7 I4 (S4_OFF_FRACTION, 0.0 = v6.1): the first int(num_hidden_layers * S4_OFF_FRACTION) layers
+v7 I4 (S4_OFF_FRACTION; 0.0 = v6.1, as submitted): the first int(n_layers * fraction) layers
 skip B and S4 and run K3's add_rmsnorm + K4's MLP, which keeps fp16 gate/up for backward instead
 of recomputing them (same bits; see _mlp_no_recompute). First layers, because their backward runs
 last, when most saved activations are already freed, so K4's larger backward transient (fresh
@@ -65,7 +65,7 @@ import importlib
 
 import torch
 
-USE_UNPAD = False  # read by solution.apply(); False keeps the base Qwen2Model.forward untouched
+USE_UNPAD = False  # a record set by solution.apply(), which installs the patch only when U is on
 
 # v7 I4: the first int(num_hidden_layers * S4_OFF_FRACTION) packed layers skip S4 + B and run the
 # K3 add_rmsnorm + K4 MLP (fp16 gate/up kept for backward, no recompute). Same values bit for bit
@@ -76,7 +76,7 @@ S4_OFF_FRACTION = 0.0
 
 _MARK = "_soup_delta_unpad"
 _K3_MARK = "_soup_delta_addnorm"  # = solution/layers.py _MARK (K3)
-_S4_MARK = "_soup_delta_mlp_recompute"  # = solution/mlp_recompute.py _PATCH_MARK (:59)
+_S4_MARK = "_soup_delta_mlp_recompute"  # = solution/mlp_recompute.py _PATCH_MARK
 
 # At M <= 128 bitsandbytes on a T4 (sm75) runs gate/up through its own small-M GEMM, and down at
 # M <= 64 (bitsandbytes/backends/cuda/ops.py:703-709; M = A.numel() // K at :947-948), i.e. not
@@ -88,7 +88,7 @@ _MIN_PAD_DIV = 32
 
 _HOOK_DICTS = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
 
-# Calls that took each path. Python ints only; tests and a debug notebook read them.
+# Calls that took each path. Python ints only; tests read them.
 # "s4_off": packed layers whose MLP ran K4 directly (I4); "s4_off_fallback": I4 wanted but the MLP
 # was called as a module (guards failed), i.e. v6.1's S4 path.
 COUNTS = {"packed": 0, "original": 0, "s4_off": 0, "s4_off_fallback": 0}
@@ -150,7 +150,7 @@ def _row_indices(attention_mask):
 
     The mask must be binary, right-padded (TRL's collator) and have a real first token in every
     row. The check stays on the device and gates the mask, so a bad mask makes `nonzero` return
-    nothing instead of costing a second host sync (idea: GPT-6-Astra variant). Reads only.
+    nothing instead of costing a second host sync (idea from a GPT-6-Astra draft). Reads only.
     """
     keep = attention_mask.eq(1)
     valid = (
@@ -357,7 +357,7 @@ def _k4_forward(mlp):
     """The forward S4 itself falls back to, when it may be called directly on this module.
 
     S4's class patch keeps the forward it wrapped (K4) in `__wrapped__` and calls exactly that
-    when it does not recompute (solution/mlp_recompute.py:365, 386, 390). Calling it directly
+    when it does not recompute (mlp_recompute.py: `return previous(self, x)`). Calling it directly
     skips only Module.__call__, which with no hooks on the module (checked here) and no global
     hooks (checked by _fast_path_ok) does nothing else. Qwen2MLP has no transformers capture hooks
     (modeling_qwen2.py:314-317 records decoder layers and attention only). None otherwise. Reads only.
@@ -374,8 +374,8 @@ def _k4_forward(mlp):
 def _mlp_no_recompute(mlp, y):
     """mlp(y) without S4's recompute: K4 keeps the fp16 gate/up for backward instead.
 
-    Bit-identical to S4 (tests/test_mlp_recompute.py:103-118 checks torch.equal of outputs and
-    input grads against K4), and so to B (tests/test_peak_v6.py:245-275 checks B == K3 + S4).
+    Bit-identical to S4 (solution/tests: test_mlp_recompute.py::test_bit_exact_against_k4) and so
+    to B (test_peak_v6.py::test_fused_block_bit_exact_and_saves_less checks B == K3 + S4).
     Any guard failure calls the module, which is v6.1's unfused S4 path (same values again).
     """
     try:
@@ -459,6 +459,25 @@ def _row_scope(mask, idx, batch, seq):
     return a1.row_compact_scope(mask, idx, batch, seq)
 
 
+def _merged_attention(attn, x_bt, mask, pos_ids, use_cache, pos_emb, kwargs):
+    """v11 Q: solution/merged_qkv.py attention_forward (the attention output, o_proj included)
+    when its flag is on and the module may be called without Module.__call__ (no hooks but
+    transformers' idle capture hooks, as for the bypassed decoder layers: the collector is {} on
+    this path, output_capturing.py:105-110), else None. A None means nothing ran."""
+    q = _REFS.get("merged_qkv")
+    if q is None or not q.USE_MERGED_QKV:
+        return None
+    try:
+        ok = _bypassed_layer_ok(attn)
+    except Exception:  # noqa: BLE001 - a read-only guard
+        ok = False
+    if not ok:
+        return None
+    attn_kwargs = dict(kwargs)
+    attn_kwargs.update(position_ids=pos_ids, use_cache=use_cache)  # the call's other kwargs
+    return q.attention_forward(attn, x_bt, mask, pos_emb, attn_kwargs)
+
+
 def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, kwargs, k3,
                   s4_off=False):
     """One decoder layer, modeling_qwen2.py:279-298, with the token-wise ops on [N, C].
@@ -474,15 +493,20 @@ def _layer_packed(layer, r, idx, batch, seq, mask, pos_emb, pos_ids, use_cache, 
     # rebuild it from r in backward (entered second, so its lora_A hooks are the innermost).
     with _attention_scope(idx, batch, seq, x_bt.shape[-1]), \
             _lora_source_scope(layer.input_layernorm, r, x_bt, idx):
-        a_bt, _ = layer.self_attn(  # lines 282-290: the same arguments and kwargs, base shapes
-            hidden_states=x_bt,
-            attention_mask=mask,
-            position_ids=pos_ids,
-            past_key_values=None,
-            use_cache=use_cache,
-            position_embeddings=pos_emb,
-            **kwargs,
-        )
+        # v11 Q (solution/merged_qkv.py): q/k/v base projections as one GEMM when its guards
+        # pass (inside both scopes: it needs M2's source); None means nothing ran.
+        a_bt = _merged_attention(layer.self_attn, x_bt, mask, pos_ids, use_cache, pos_emb,
+                                 kwargs)
+        if a_bt is None:
+            a_bt, _ = layer.self_attn(  # lines 282-290: same arguments and kwargs, base shapes
+                hidden_states=x_bt,
+                attention_mask=mask,
+                position_ids=pos_ids,
+                past_key_values=None,
+                use_cache=use_cache,
+                position_embeddings=pos_emb,
+                **kwargs,
+            )
     del x_bt
     a = pack_rows(a_bt, idx)
     del a_bt
@@ -612,9 +636,10 @@ def patch_qwen2_model_unpad():
                 mlp_cls=mlp_cls,
                 layer_forward=(layer_forward if _is_genuine(layer_forward, mq.__name__,
                                                             "Qwen2DecoderLayer.forward") else None))
-    # v6 helpers (pure Python, no CUDA at import); missing ones just keep v5's ops.
+    # Helpers from v6 on (pure Python, no CUDA at import); a missing one keeps the path without it.
     for key, name in (("fused_block", "fused_block"), ("saved_compact", "saved_compact"),
-                      ("sdpa_recompute", "sdpa_recompute"), ("lora_recompute", "lora_recompute")):
+                      ("sdpa_recompute", "sdpa_recompute"), ("lora_recompute", "lora_recompute"),
+                      ("merged_qkv", "merged_qkv")):  # v11 Q
         try:
             refs[key] = importlib.import_module(f"{__package__}.{name}")
         except Exception:  # noqa: BLE001

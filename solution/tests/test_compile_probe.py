@@ -1,4 +1,4 @@
-"""C0 / v8 C1: Triton compile probe.
+"""v8 C1: Triton compile probe.
 
 How many kernel binaries (*.cubin) and gcc-built launchers (__triton_launcher*.so) an empty Triton
 cache gets from one round of calls of every kernel the training path launches, and that a second

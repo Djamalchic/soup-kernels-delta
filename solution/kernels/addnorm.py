@@ -1,4 +1,4 @@
-"""K3: fused residual add + Qwen2 RMSNorm, forward and backward (two Triton kernels).
+"""K3: fused residual add + Qwen2 RMSNorm, forward and backward (the run launches the *_v10 pair).
 
 Reference math, transformers 5.16.1 models/qwen2/modeling_qwen2.py:
 - Qwen2RMSNorm.forward (lines 247-252): u = f32(x); r = rsqrt(mean(u^2) + eps); y = w * cast_in(u * r)
@@ -55,7 +55,7 @@ v8 bodies plus casts that used to be separate torch launches:
   temporary only B owns). Every fp32 -> fp16 cast is an explicit round-to-nearest-even, as torch's.
 The reductions keep the v8 expressions; whether Triton keeps the v8 register layout (and so the
 v8 summation order of rstd / mean(g x)) with the extra fp16 loads and stores is checked on the T4
-(tests/test_ew_fusion.py); if it does not, values move by fp32 ulps against v9b and stay
+(solution/tests/test_ew_fusion.py); if it does not, values move by fp32 ulps against v9b and stay
 consistent inside a run (forward, recompute and replay all use these entries).
 """
 
@@ -68,7 +68,7 @@ from .. import precompile as _precompile
 
 HIDDEN_SIZE = 1536  # Qwen2.5-1.5B hidden size; the only width this file accepts
 BLOCK = 2048  # next power of two >= HIDDEN_SIZE
-NUM_WARPS = 4  # 128 threads x 16 elements per row; 8 is the alternative to time on T4
+NUM_WARPS = 4  # 128 threads x 16 elements per row
 # v8 C1: launch the *_usig entries below instead of the two kernels directly. solution.apply()
 # sets it; the module default is the v7 launch.
 USE_UNIFIED_SIG = False

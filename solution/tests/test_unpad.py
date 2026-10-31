@@ -124,8 +124,8 @@ def num_items(batch):
 def run(pm, batch, forward, seed=1234, **extra):
     """One training forward + backward with a given Qwen2Model.forward. Records the final hidden
     states, the RNG state before every LoRA dropout call and after the forward, the full keep-mask
-    of every dropout call (replayed on ones from the recorded state, idea from the GPT-6-Astra
-    variant) and the LoRA gradients."""
+    of every dropout call (replayed on ones from the recorded state, idea from a GPT-6-Astra
+    draft) and the LoRA gradients."""
     mq.Qwen2Model.forward = forward
     pm.zero_grad(set_to_none=True)
     rec = {"hidden": None, "rng_pre": [], "drop": []}
