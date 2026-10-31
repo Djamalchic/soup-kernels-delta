@@ -4,8 +4,8 @@
 > - **Result.** 64.1 s against 82.9 s (s = 1.293), peak 2,335 against 14,345 MiB (m = 6.144), eval loss 2.04965 against 2.04964, 10 of 10 checks passed.
 > - **Kernels.** Five of ours: NF4 dequant, LM head + cross entropy, add + RMSNorm forward and backward, SwiGLU; one launcher.
 > - **What is new.** No [B, T, V] logits, no padding in token-wise ops, backward tensors recomputed or kept on real rows, compile overlapped with model loading, q, k, v as one GEMM.
-> - **Verify.** Copy the notebook [TODO final link] with `COMMIT = "[TODO final commit]"` and click Run All.
-> - **Code.** https://github.com/BAITC-Hacks/hack-8cddb4ae-delta, code v11 = `f218f86`; the final commit [TODO final commit] changes only documentation.
+> - **Verify.** Copy the notebook https://www.kaggle.com/code/jamildeltacaptain/notebook0289d149f3 (its saved version already has `COMMIT` set to the final commit, tag `submission`) and click Run All.
+> - **Code.** https://github.com/BAITC-Hacks/hack-8cddb4ae-delta, code v11 = `f218f86`; the final commit (tag `submission`, https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/tree/submission) changes only documentation.
 
 ## 1. What we did and why
 
@@ -69,9 +69,9 @@ ChatGPT (GPT-6-Astra) and Claude were used as coding assistants, as the rules al
 
 ## 2. How to run
 
-1. Open the public notebook [TODO final link] and click Copy & Edit. GPU and Internet need a phone-verified Kaggle account.
+1. Open the public notebook https://www.kaggle.com/code/jamildeltacaptain/notebook0289d149f3 and click Copy & Edit. GPU and Internet need a phone-verified Kaggle account.
 2. Set Accelerator to **GPU T4 x2** and switch **Internet on**.
-3. In the first code cell, check `REPO_URL = "https://github.com/BAITC-Hacks/hack-8cddb4ae-delta.git"` and `COMMIT = "[TODO final commit]"`.
+3. In the first code cell, check `REPO_URL = "https://github.com/BAITC-Hacks/hack-8cddb4ae-delta.git"` and `COMMIT` is the final commit (the hash of tag `submission`, shown at https://github.com/BAITC-Hacks/hack-8cddb4ae-delta/tree/submission).
 4. Click Run > Restart & clear cell outputs. Add no GPU cells of your own: check 9 needs idle GPUs.
 5. Click Run All. The notebook is `templates/kaggle_notebook.ipynb` with one edit, `--repeats 2` for the jury's order base, ours, ours, base. It installs the pinned packages, clones the repository at `COMMIT` and runs:
 
